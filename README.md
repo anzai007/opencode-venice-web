@@ -33,7 +33,7 @@ That installs the code to `~/.local/share/opencode-venice-web`, adds the `venice
 
 Add `--with-nul-plugin` if you also use other providers from OpenCode (see [NUL bytes](#nul-bytes-and-400-invalid-request)).
 
-Then **restart OpenCode** and pick a model such as `venice-web/deepseek-v4-1-flash-free`.
+Then **restart OpenCode** and pick a model such as `venice-web/deepseek-v4-1-flash-uncensored`.
 
 Or without cloning:
 
@@ -90,7 +90,7 @@ Only models the web catalogue marks as free (`usesCredits: false`) are exposed -
 
 | Family | Model ids |
 | --- | --- |
-| DeepSeek | `deepseek-v4-1-flash-free`, `deepseek-ai-DeepSeek-V3.2` |
+| DeepSeek | `deepseek-v4-1-flash-uncensored`, `deepseek-ai-DeepSeek-V3.2` |
 | Qwen | `qwen-3-8-27b`, `qwen3-6-27b`, `qwen3-5-35b-a3b` |
 | GLM | `zai-org-glm-5.2`, `zai-org-glm-4.6` |
 | Gemma | `google-gemma-4-31b-it`, `google-gemma-4-26b-a4b-it`, `gemma4-uncensored` |
@@ -101,6 +101,8 @@ Only models the web catalogue marks as free (`usesCredits: false`) are exposed -
 All of them take images: each one read a test picture correctly through this proxy, so the sync marks them with image input and OpenCode lets you attach pictures. Rerun `venice-web-sync` after updating if OpenCode says a model does not support images.
 
 The catalogue lives in [`src/lib/models.mjs`](src/lib/models.mjs); edit it and rerun `venice-web-sync` if Venice adds models. If the web catalogue ships a model you want, run `GET /v1/models` (or `venice-web-doctor`) after adding it to verify it is reachable.
+
+当前 DeepSeek 正式 ID 为 `deepseek-v4-1-flash-uncensored`，网页目录将 `deepseek-v4-1-flash-free` 列为其别名。代理继续接受旧 ID，并统一向上游发送正式 ID；模型列表只展示正式 ID。目录记录的上下文为 524288 token，最大输出为 131072 token。执行配置同步会迁移当前 Provider 的旧别名，同时保留其他 Provider 的默认选择。
 
 ---
 
@@ -186,7 +188,7 @@ All environment variables are optional; the defaults are what the installer uses
 ## Limitations (read these)
 
 - **Not the official API.** The web endpoints are undocumented and may change. `middleface` version headers are pinned to what the current web client sends.
-- **Tool calls are emulated.** The web endpoint ignores OpenAI `tools`, so the model answers with a JSON envelope that the proxy turns into `tool_calls`. This is reliable in practice (see [docs/PROTOCOL.md](docs/PROTOCOL.md) for the measured technique) but it is a prompt contract, not a native feature: `tool_choice: required` is advisory, and with tools in the request the answer arrives buffered rather than token-by-token (reasoning still streams live).
+- **工具调用与流式显示。** 网页端不原生接受 OpenAI `tools`，代理通过 JSON 协议模拟调用，`tool_choice: required` 仍只是提示约束。OpenCode 带工具的流式请求现在会增量显示最终正文：模型先输出 `status`、`tool_calls`，确认 `done`/`ask` 且无待执行工具后，代理实时解码 `content`。工具参数、旧字段顺序和格式异常仍先缓冲校验；推理继续实时输出。已经显示的合法最终回答不再经过评判器替换，避免重试导致重复内容。
 - **No sampling controls.** `temperature`, `top_p` and `max_tokens` are not applied by this endpoint.
 - **Unlimited, not infinite.** Venice's fair-use and Cloudflare bot checks apply. A Cloudflare challenge surfaces as HTTP 401 with a "refresh the cookies" message.
 - **Images: what is sent.** The images of your latest message go to the model as images, on every step of the work they start. Images from earlier messages stay in the history as `[image]` and are not sent again. Only pictures inside the request (data URLs, which is what OpenCode sends) are used, up to 10 per message; the proxy never downloads an image from a URL.
@@ -237,7 +239,7 @@ Use it from any git repository:
 /opencode-orchestrator add input validation to the signup form and test it
 ```
 
-Without a task it continues the backlog in `.orchestrator/STATUS.md` (or asks what to do). Claude asks for the worker model at the start of the session; set it yourself with `export ORCH_MODEL=venice-web/deepseek-v4-1-flash-free`.
+Without a task it continues the backlog in `.orchestrator/STATUS.md` (or asks what to do). Claude asks for the worker model at the start of the session; set it yourself with `export ORCH_MODEL=venice-web/deepseek-v4-1-flash-uncensored`.
 
 What the scripts guard against (each of these cost hours in real sessions):
 

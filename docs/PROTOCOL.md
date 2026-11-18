@@ -1,5 +1,7 @@
 # Protocol notes
 
+2026-11-17 目录校正：网页 `/api/app/models` 当前返回正式 ID `deepseek-v4-1-flash-uncensored`，`aliasIds` 包含 `deepseek-v4-1-flash-free`，`usesCredits` 为 `false`；上下文为 524288，输出上限为 131072。下文历史抓包和测量保留当时使用的旧别名。现在聊天和评判请求统一解析为正式 ID，模型列表仅展示正式 ID。
+
 Everything here was reverse engineered from live venice.ai web traffic. These endpoints are undocumented and can change; treat this file as the map of what the code depends on.
 
 > Keep this file in sync with `src/lib/venice.mjs`, `src/lib/emulate.mjs` and `src/lib/server.mjs`. If Venice changes something, the fix belongs in those files and the finding belongs here.
@@ -247,6 +249,14 @@ The 3 needless retries are one case, "compute X and write it to a file" answered
 * Retrying with a *system* reminder: `1/4`, versus `4/4` for a user-message reminder.
 
 ## 5. Translation tables
+
+### OpenCode 带工具请求的增量正文（2026-11-18）
+
+新的协议提示和历史消息统一使用 `{"status":"done","tool_calls":[],"content":"..."}` 顺序。`stream:true` 时，代理确认正文之前的元数据声明 `done`/`ask` 且 `tool_calls` 为空，就开始增量解码正文；无需等到 JSON 闭合或 `response.completed`。JSON 转义、Unicode 和跨分片代理项由 `src/lib/envelope-stream.mjs` 处理，不会把协议头或工具参数直接发送给客户端。
+
+工具轮次仍需完整解析和参数校验后才能执行。模型未遵守新字段顺序、输出非法前缀或需要格式修复时，回退原有缓冲路径。已输出合法最终正文后跳过会替换该答案的重试和评判；否则用户已看到的文字无法撤回。工具修复的重试保持缓冲，不提前显示未选中的候选答案，最终只追加未发送的尾部；若修复得到不同正文，则作为补充输出。`stream:false` 及未指定 `stream` 的请求继续返回完整 JSON。
+
+验收：`node --test test/*.test.mjs` 覆盖上游尚未结束时的正文到达、完整流无重复、工具参数隔离、转义与旧格式回退。`node scripts/verify-stream.mjs` 实际发送带工具的网络请求，断言多个正文分片持续到达，并检查工具调用与结果回传及非流式 JSON。默认使用 `venice-uncensored-1-2`；可用 `STREAM_TEST_MODEL` 指定其他模型。
 
 OpenAI → Venice:
 

@@ -1,14 +1,10 @@
 /**
- * HTTP layer: an OpenAI-compatible `/v1/chat/completions` (streaming and not)
- * plus `/v1/models` and `/health`.
- *
- * Reply handling: reasoning deltas stream straight through, and so does content
- * when tools are not emulated. With emulated tools the message is read to the end
- * first, because the whole text has to be parsed before we know whether it is an
- * answer or a tool call; those deltas are buffered and replayed in order. An SSE
- * keepalive comment bridges the silent stretches.
+ * OpenAI 兼容 HTTP 层：聊天、模型目录、健康检查与图片接口。
+ * 推理及普通正文直接转发；工具协议只有先确认最终状态和空工具列表，才增量解码正文。
+ * 工具调用、旧格式及修复重试保持完整缓冲与参数校验，SSE 心跳覆盖静默等待。
  */
 import { randomUUID } from 'node:crypto'
+import { envelopeContentStream, remainingContent } from './envelope-stream.mjs'
 import { writeFileSync } from 'node:fs'
 import { apiBase, debug, dumpFile, host, judgeEnabled, judgeModel, judgeTimeoutMs, port, providerID } from './config.mjs'
 import {
@@ -106,16 +102,10 @@ function modelList() {
 }
 
 /**
- * Reads an upstream stream to completion, yielding deltas that are safe to
- * forward while it runs: reasoning always, content only when tools are not
- * emulated (in emulated mode the whole text has to be parsed first).
- *
- * The returned generator resolves to the collected state. With `stopServerLoop`
- * it stops early when Venice's own agent loop runs past `SERVER_LOOP_STEPS` and
- * sets `serverLoop` (see the comment in `apply`).
- * @returns {AsyncGenerator<object, {text: string, answer: string, reasoning: string, terminal: boolean, chunks: object[], steps: Set<string>, nativeTools: Set<string>, serverLoop: boolean}>}
+ * 读取上游 SSE 并收集完整状态；streamContent 开启时提前输出协议中已确认的最终正文。
+ * 推理始终实时转发。stopServerLoop 在上游原生工具循环超限时停止读取，以便外层修复重试。
  */
-export async function* collectStream(upstreamBody, mapping, chunk, { stopServerLoop = false } = {}) {
+export async function* collectStream(upstreamBody, mapping, chunk, { stopServerLoop = false, streamContent = false } = {}) {
   const reader = upstreamBody.getReader()
   const stream = sseReader()
   const state = {
@@ -128,8 +118,10 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
     nativeTools: new Set(),
     serverLoop: false,
     events: {},
+    liveContent: '',
   }
   const itemTypes = new Map()
+  const contentReader = streamContent && mapping.emulatedTools ? envelopeContentStream() : null
 
   const apply = (event) => {
     if (event.type === 'error' || event.type === 'response.failed') {
@@ -169,7 +161,14 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
         state.reasoning += delta
         return chunk({ reasoning_content: delta })
       }
-      if (mapping.emulatedTools) state.text += delta
+      if (mapping.emulatedTools) {
+        state.text += delta
+        const visible = contentReader?.feed(delta)
+        if (visible) {
+          state.liveContent += visible
+          return chunk({ content: visible })
+        }
+      }
       else {
         state.answer += delta
         return chunk({ content: delta })
@@ -256,7 +255,7 @@ async function askJudge(body, message, signal) {
  * upstream attempt (free on the web plan). `preferAnswer()` decides whether the
  * retry replaces the first answer, so a retry can never blank out a good reply.
  */
-async function* openaiChunks(body, mapping, upstreamBody, signal) {
+export async function* openaiChunks(body, mapping, upstreamBody, signal) {
   const id = `chatcmpl-${randomUUID().replaceAll('-', '')}`
   const created = Math.floor(Date.now() / 1000)
   const chunk = (delta, finish = null, extra = {}) => ({
@@ -270,7 +269,10 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
 
   yield chunk({ role: 'assistant', content: '' })
 
-  let state = yield* collectStream(upstreamBody, mapping, chunk, { stopServerLoop: mapping.emulatedTools })
+  // 显式要求调用工具时不能提前提交无工具答案，仍需保留原有重试机会。
+  const requiresTool = body.tool_choice === 'required' || (body.tool_choice && typeof body.tool_choice === 'object')
+  let state = yield* collectStream(upstreamBody, mapping, chunk, { stopServerLoop: mapping.emulatedTools, streamContent: body.stream === true && !requiresTool })
+  const sentContent = state.liveContent
   let message = null
 
   if (mapping.emulatedTools) {
@@ -305,6 +307,9 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
     // last retry produced reached the user without the judge ever seeing it
     // (a made-up "the tools all returned Tool not found", 2026-11-05).
     for (;;) {
+      // 已展示的合法最终回答不再交给评判器替换，避免用户看到重试答案和重复正文。
+      // 工具轮次、空回答及破损协议仍沿用原有修复流程，重试结果保持缓冲直到校验完成。
+      if (sentContent && !message.tool_calls && !message.brokenEnvelope && !message.serverLoop && ['done', 'ask'].includes(message.status)) break
       let decision = shouldRetry({ message, lastRole: last?.role, available })
       if (decision.judge) {
         if (!judgeEnabled || judged >= 2) break
@@ -352,16 +357,16 @@ async function* openaiChunks(body, mapping, upstreamBody, signal) {
 
   if (mapping.emulatedTools) {
     contentForUsage = message.content ?? ''
+    const tail = remainingContent(contentForUsage, sentContent)
+    if (tail) yield chunk({ content: tail })
     if (message.tool_calls) {
       finish = 'tool_calls'
       log(`  <- tools: ${message.tool_calls.map((call) => `${call.function.name}(${call.function.arguments.slice(0, 80)})`).join(' | ')}`)
       yield chunk({
-        content: message.content || '',
         tool_calls: message.tool_calls.map((call, index) => ({ index, ...call })),
       })
     } else {
       log(`  <- no tools${message.status ? ` • status ${message.status}` : ''} • text: ${preview(message.content ?? '', 110)}`)
-      yield chunk({ content: message.content ?? '' })
     }
   }
 
@@ -539,7 +544,7 @@ async function handleChat(req, res) {
 
   const names = [...mapping.toolNames]
   log(
-    `-> ${body.model} • ${body.messages?.length ?? 0} msgs • ${names.length} tools${names.length ? ` [${names.join(',')}]` : ''}${mapping.images.length ? ` • ${mapping.images.length} image(s)` : ''} • stream=${body.stream !== false}`,
+    `-> ${body.model} • ${body.messages?.length ?? 0} msgs • ${names.length} tools${names.length ? ` [${names.join(',')}]` : ''}${mapping.images.length ? ` • ${mapping.images.length} image(s)` : ''} • stream=${body.stream === true}`,
   )
 
   const abort = new AbortController()
@@ -559,7 +564,8 @@ async function handleChat(req, res) {
 
   const chunks = openaiChunks(body, mapping, upstream.body, abort.signal)
 
-  if (body.stream === false) {
+  // 遵循 OpenAI 默认行为：只有显式启用流式输出时才返回 SSE，兼容未传 stream 的客户端。
+  if (body.stream !== true) {
     const message = { role: 'assistant', content: '' }
     let finish = 'stop'
     let usage = null

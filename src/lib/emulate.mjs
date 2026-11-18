@@ -13,7 +13,7 @@
  *     convert deltas into OpenAI streaming chunks.
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { MODELS } from './models.mjs'
+import { MODELS, resolveModelId } from './models.mjs'
 import { readLenient } from './lenient-json.mjs'
 import { repairJsonControlChars } from './sanitize.mjs'
 
@@ -30,7 +30,8 @@ import { repairJsonControlChars } from './sanitize.mjs'
  */
 export const TOOL_PROMPT = `You are connected to an external agent that executes tools on the user's computer. These tools ARE called directly by name in \`tool_calls\` (not inside \`execute\`); they are NOT Venice server tools.
 Return ONLY one valid JSON object, without markdown fences and without any text outside JSON, with this exact shape:
-{"content":"text for the user, or an empty string","status":"continue","tool_calls":[{"name":"exact tool name","arguments":{}}]}
+{"status":"done","tool_calls":[],"content":"text for the user"}
+Always write the keys in this order: status, tool_calls, content. This lets the client display the final content as you write it. For tool requests use status continue and tool_calls [{"name":"exact tool name","arguments":{}}], then content (text for the user, or an empty string).
 "status" is required and is one of:
 - "continue": the request needs more work from you. tool_calls must then contain the next tool call(s).
 - "done": the whole request is finished; "content" is your final answer and tool_calls is []. The final answer states the results the user asked for (numbers, names, findings, answers, what changed); "it is done" or "see the file" alone is not an answer.
@@ -42,9 +43,9 @@ For a script longer than one line, write it to a file first and run the file; do
 
 /** Appended as the last user message; see docs/PROTOCOL.md ("format reminder"). */
 export const REMINDER_FIRST_TURN =
-  'Reply with exactly one JSON object and nothing else, with "status". If the task needs files, a command or a search, call those tools in tool_calls now with "status":"continue" - do not answer yet.'
+  'Reply with exactly one JSON object and nothing else; write keys in order: status, tool_calls, content. For a completed text answer use "status":"done" and "tool_calls":[] before content. If the task needs files, a command or a search, call those tools in tool_calls now with "status":"continue" - do not answer yet.'
 export const REMINDER_AFTER_TOOL =
-  'Reply with exactly one JSON object and nothing else. If more work is needed, call the next tool now with "status":"continue". Only when the whole request is finished answer with "status":"done" and "tool_calls":[]; use "status":"ask" only for a question the user must answer.'
+  'Reply with exactly one JSON object and nothing else; write keys in order: status, tool_calls, content. If more work is needed, call the next tool now with "status":"continue". Only when the whole request is finished answer with "status":"done" and "tool_calls":[]; use "status":"ask" only for a question the user must answer.'
 
 /**
  * Goes with the images when they are moved past the user's own message (see
@@ -91,7 +92,7 @@ export const EMPTY_RETRY_REMINDER =
 
 /** Sent when the reply looked like an envelope but could not be read. */
 export const BROKEN_ENVELOPE_REMINDER =
-  'your last reply was not valid JSON, so its tool calls could not be executed. Send it again as exactly one valid JSON object: {"content":"...","status":"...","tool_calls":[{"name":"...","arguments":{...}}]}, closing every object and escaping quotes and line breaks inside strings.'
+  'your last reply was not valid JSON, so its tool calls could not be executed. Send it again as exactly one valid JSON object: {"status":"...","tool_calls":[{"name":"...","arguments":{...}}],"content":"..."}, closing every object and escaping quotes and line breaks inside strings.'
 
 /** Sent when the model said it is not finished but called no tool. */
 export const CONTINUE_REMINDER =
@@ -255,7 +256,7 @@ export function buildJudgeRequest(body, message, model) {
     `AGENT REPLY (declared status: ${message.status ?? 'none'}):\n${tail((message.content ?? '').trim(), 3000) || '(empty)'}`,
   ].join('\n\n')
   return {
-    modelId: model,
+    modelId: resolveModelId(model),
     systemPrompt: { instructions: JUDGE_PROMPT },
     messages: [
       {
@@ -430,7 +431,8 @@ function safeJson(value) {
  * @returns {{ request: object, toolNames: Set<string>, toolSchemas: Map<string, object>, emulatedTools: boolean, images: {mediaId: string, mimeType: string, data: Buffer}[] }}
  */
 export function toVeniceRequest(body) {
-  if (!MODELS[body.model]) {
+  const modelId = resolveModelId(body.model)
+  if (!Object.hasOwn(MODELS, modelId)) {
     throw new Error(`unknown model: ${body.model}. Known: ${Object.keys(MODELS).join(', ')}`)
   }
   if (!Array.isArray(body.messages) || body.messages.length === 0) throw new Error('messages must not be empty')
@@ -478,13 +480,13 @@ export function toVeniceRequest(body) {
       // ended it), otherwise the model copies envelopes that have none.
       const calls = message.tool_calls ?? []
       content = JSON.stringify({
-        content: text,
         status: calls.length ? 'continue' : 'done',
         tool_calls: calls.map((call) => ({
           id: call.id,
           name: call.function?.name,
           arguments: safeJson(call.function?.arguments),
         })),
+        content: text,
       })
     }
 
@@ -532,7 +534,7 @@ export function toVeniceRequest(body) {
 
   return {
     request: {
-      modelId: body.model,
+      modelId,
       systemPrompt: { instructions: instructions.filter(Boolean).join('\n\n') },
       messages: withImagesLast(messages),
       tools: [],

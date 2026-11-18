@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path'
 import os from 'node:os'
 import { port, providerID } from './lib/config.mjs'
-import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL, MODELS } from './lib/models.mjs'
+import { DEFAULT_MODEL, DEFAULT_SMALL_MODEL, MODELS, resolveModelId } from './lib/models.mjs'
 import { log, warn } from './lib/log.mjs'
 
 const args = process.argv.slice(2)
@@ -55,6 +55,13 @@ if (args.includes('--remove')) {
   if (args.includes('--default')) {
     config.model = `${providerID}/${DEFAULT_MODEL}`
     config.small_model = `${providerID}/${DEFAULT_SMALL_MODEL}`
+  }
+  // 仅迁移当前 Provider 的旧模型别名，保留用户选择的其他 Provider 和默认模型。
+  for (const key of ['model', 'small_model']) {
+    const prefix = `${providerID}/`
+    if (typeof config[key] === 'string' && config[key].startsWith(prefix)) {
+      config[key] = prefix + resolveModelId(config[key].slice(prefix.length))
+    }
   }
 }
 

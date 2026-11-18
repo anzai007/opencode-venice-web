@@ -4,7 +4,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { IMAGE_NOTE, MAX_IMAGES, imageFromDataUrl, splitImages, toVeniceRequest, withImagesLast, withRetryReminder } from '../src/lib/emulate.mjs'
+import { IMAGE_NOTE, MAX_IMAGES, REMINDER_AFTER_TOOL, imageFromDataUrl, splitImages, toVeniceRequest, withImagesLast, withRetryReminder } from '../src/lib/emulate.mjs'
 import { multipartBody } from '../src/lib/venice.mjs'
 import { DEFAULT_MODEL, MODELS } from '../src/lib/models.mjs'
 
@@ -103,7 +103,7 @@ test('in a tool loop the image rides on the last user message, so the model sees
   // the reminder after a tool result is still the one picked, and it now carries the image and says whose it is
   assert.equal(reminder.content[0].type, 'input_image')
   assert.equal(reminder.content[0].media_id, mapping.images[0].mediaId)
-  assert.match(reminder.content[1].text, /^\(format reminder\) Reply with exactly one JSON object and nothing else\. If more work/)
+  assert.equal(reminder.content[1].text, `(format reminder) ${REMINDER_AFTER_TOOL}`)
   assert.equal(reminder.content.at(-1).text, IMAGE_NOTE)
   // a retry appends another user message, and the image moves onto it
   const retried = withRetryReminder(mapping.request).messages

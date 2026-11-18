@@ -14,7 +14,7 @@
  * (docs/PROTOCOL.md §2b); OpenCode only sends images to those.
  */
 export const MODELS = {
-  'deepseek-v4-1-flash-free': { name: 'DeepSeek V4.1 Flash Uncensored (web)', context: 524288, output: 32768, reasoning: true, vision: true },
+  'deepseek-v4-1-flash-uncensored': { name: 'DeepSeek V4.1 Flash Uncensored (web)', context: 524288, output: 131072, reasoning: true, vision: true },
   'qwen-3-8-27b': { name: 'Qwen 3.8 27B (web)', context: 262144, output: 65536, reasoning: true, vision: true },
   'qwen3-6-27b': { name: 'Qwen 3.6 27B (web)', context: 256000, output: 65536, reasoning: true, vision: true },
   'qwen3-5-35b-a3b': { name: 'Qwen 3.5 35B A3B (web)', context: 256000, output: 16384, reasoning: true, vision: true },
@@ -35,8 +35,18 @@ export const MODELS = {
   'e2ee-qwen3-vl-30b-a3b-p': { name: 'Qwen3 VL 30B A3B TEE (web)', context: 128000, output: 4096, reasoning: false, vision: true },
 }
 
-/** Default model, used by the installer and `sync --default`. */
-export const DEFAULT_MODEL = 'deepseek-v4-1-flash-free'
+/** 安装器及配置同步统一使用网页目录中的正式模型 ID。 */
+export const DEFAULT_MODEL = 'deepseek-v4-1-flash-uncensored'
+
+/** 网页目录的 aliasIds 已确认旧 ID；保留请求兼容，但模型列表只展示正式 ID。 */
+export const MODEL_ALIASES = Object.freeze({
+  'deepseek-v4-1-flash-free': DEFAULT_MODEL,
+})
+
+/** 统一解析官方别名，避免正常聊天与评判请求使用不同的上游模型 ID。 */
+export function resolveModelId(id) {
+  return Object.hasOwn(MODEL_ALIASES, id) ? MODEL_ALIASES[id] : id
+}
 
 /** Cheap model for titles/summaries. */
 export const DEFAULT_SMALL_MODEL = 'qwen3-5-35b-a3b'
