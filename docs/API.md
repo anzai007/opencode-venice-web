@@ -318,9 +318,72 @@ curl -sS "{{BASE_URL}}/v1/characters?page=1&pageSize=10&sortBy=featured&isAdult=
 * **接口**：`GET /v1/characters/:id/photo`（别名：`GET /characters/:id/photo`）
 * **说明**：返回角色头像二进制图片（含 `Cache-Control: public, max-age=3600`）。
 
-### 5.5 实战：拉取角色后发起对话
+### 5.5 与指定角色对话 (`POST /v1/characters/:id/chat`)
 
-拿到 `GET /v1/characters/:id` 返回的 `jsonData` 后，将 `jsonData.instructions` 放入 `system` 消息，将 `jsonData.intro` 作为首条 `assistant` 消息，即可直接调用 `POST /v1/chat/completions` 与任意免费网页模型（如 `deepseek-v4-1-flash-uncensored`）展开角色扮演对话，无需局限于角色自带的 `modelId`。
+代理层自动拉取并缓存角色完整设定（`instructions`、`intro`、`description`、`context`），并走纯文本对话格式转发至上游推理通道，支持流式 SSE 与非流式 JSON 响应，也支持直接传入 OpenAI SDK 的 `base_url` 习惯路径 `POST /v1/characters/:id/chat/completions`（或省略 `/v1` 前缀）。
+
+* **接口**：`POST /v1/characters/:id/chat`（兼容别名：`POST /v1/characters/:id/chat/completions`、`POST /characters/:id/chat`）
+* **Content-Type**：`application/json`
+
+| 请求字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `messages` | array | 是 | 对话消息数组，至少包含一条 `user` 消息；支持 `system`/`developer`/`user`/`assistant` 与 Base64 `image_url` 多模态输入 |
+| `model` | string | 否 | 覆盖推理模型（须为 3.2 中的免费模型 ID）；留空 / `"auto"` / `"default"` 时，若角色绑定的 `modelId` 属于免费模型则沿用，否则自动安全回退至 `deepseek-v4-1-flash-uncensored` |
+| `stream` | boolean | 否 | 默认 `false`（返回完整 JSON）；传 `true` 返回 OpenAI SSE 流 |
+| `include_intro` | boolean | 否 | 默认 `true`：当 `messages` 中尚无 `assistant` 历史消息时，自动注入角色的 `jsonData.intro` 作为开场首轮回复 |
+| `reasoning_effort` | string | 否 | 同 `/v1/chat/completions`（`none`/`disabled`、`adaptive`/`medium`、`high`/`enabled`） |
+| `system_prompt` | string | 否 | 附加在角色人设后面的额外系统指令 |
+
+**调用示例（`curl` 非流式）**：
+```sh
+curl -sS "{{BASE_URL}}/v1/characters/0fc3e7d1-3385-49bc-81c7-99457a90c0e7/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": false,
+    "messages": [
+      { "role": "user", "content": "Hi, nice to meet you! Need a hand with those boxes?" }
+    ]
+  }'
+```
+
+**非流式响应示例 (`200 OK`)**：
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1795072000,
+  "model": "zai-org-glm-4.6",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "..." },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 20, "completion_tokens": 35, "total_tokens": 55 },
+  "venice_response_id": "resp_...",
+  "character": {
+    "id": "0fc3e7d1-3385-49bc-81c7-99457a90c0e7",
+    "name": "Sable Penrose",
+    "slug": "sable-penrose",
+    "intro": "..."
+  }
+}
+```
+
+**OpenAI SDK 复用示例**：
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="{{BASE_URL}}/v1/characters/0fc3e7d1-3385-49bc-81c7-99457a90c0e7",
+    api_key="unused",
+)
+resp = client.chat.completions.create(
+    model="deepseek-v4-1-flash-uncensored",
+    messages=[{"role": "user", "content": "你好，请问需要帮忙搬东西吗？"}],
+)
+```
 
 ---
 
@@ -377,6 +440,68 @@ curl -sS "{{BASE_URL}}/v1/characters?page=1&pageSize=10&sortBy=featured&isAdult=
 * **头像**：`GET /v1/minds/:slug/avatar`（支持可选参数 `?h=:avatarHash`）
 * **封面**：`GET /v1/minds/:slug/cover`（支持可选参数 `?h=:coverHash`）
 * **说明**：返回 `image/webp` 二进制图片（含 `Cache-Control: public, max-age=3600`）。
+
+### 6.7 与指定 Mind 对话 (`POST /v1/minds/:slug/chat`)
+
+直接代理至 Venice 上游智能体通道 `POST /api/inference/chat/agents/:slug`，由服务端自动加载该 Mind 的系统人设、服务端工具集（`web_search`、`generate_image` 等）及子智能体团队完成推理，支持流式 SSE 与非流式 JSON 响应。
+
+> **计费提示**：部分社区 Mind 绑定了付费模型（详情接口中 `usesCredits: true`），调用此类 Mind 会消耗当前账号的 Credits；若希望免费使用，请优先选择 `usesCredits: false` 的 Mind（例如 `chef-s-razor-1107`）。
+
+* **接口**：`POST /v1/minds/:slug/chat`（兼容别名：`POST /v1/minds/:slug/chat/completions`、`POST /minds/:slug/chat`）
+* **Content-Type**：`application/json`
+
+| 请求字段 | 类型 | 必填 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `messages` | array | 是 | 对话消息数组，至少包含一条 `user` 消息；若包含 `system`/`developer` 消息会自动合并前置到首条用户消息；支持 Base64 `image_url` 图片输入 |
+| `stream` | boolean | 否 | 默认 `false`（返回完整 JSON）；传 `true` 返回 OpenAI SSE 流 |
+| `previous_response_id` | string | 否 | 上一轮返回的 `venice_response_id`（可选，用于服务端增量续接） |
+| `previous_output_index` | number | 否 | 上一轮输出索引整数（可选） |
+
+**调用示例（`curl` 非流式）**：
+```sh
+curl -sS "{{BASE_URL}}/v1/minds/chef-s-razor-1107/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stream": false,
+    "messages": [
+      { "role": "user", "content": "Hello! Introduce yourself in one short sentence." }
+    ]
+  }'
+```
+
+**非流式响应示例 (`200 OK`)**：
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1795072000,
+  "model": "mind:chef-s-razor-1107",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "I'm Chef's Razor — ..." },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 18, "completion_tokens": 22, "total_tokens": 40 },
+  "venice_response_id": "resp_...",
+  "mind": { "slug": "chef-s-razor-1107" }
+}
+```
+
+**OpenAI SDK 复用示例**：
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="{{BASE_URL}}/v1/minds/chef-s-razor-1107",
+    api_key="unused",
+)
+resp = client.chat.completions.create(
+    model="mind:chef-s-razor-1107",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
 
 ---
 

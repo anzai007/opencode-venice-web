@@ -367,6 +367,69 @@
       padding: 4px 10px;
       font-size: 11px;
     }
+    .chat-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .chat-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .chat-controls select {
+      flex: 1;
+      min-width: 180px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .chat-messages {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 280px;
+      min-height: 110px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .chat-msg {
+      padding: 8px 11px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-width: 90%;
+    }
+    .chat-msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+    }
+    .chat-msg.assistant {
+      align-self: flex-start;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .chat-msg-reasoning {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      padding-left: 8px;
+      border-left: 2px solid var(--border);
+    }
+    .chat-compose {
+      display: flex;
+      gap: 8px;
+    }
+    .chat-compose input {
+      flex: 1;
+    }
   </style>
 </head>
 <body>
@@ -450,6 +513,9 @@
     let currentPage = 1
     let lastPagination = null
     let activeCharacterDetail = null
+    let availableModels = []
+    let charChatHistory = []
+    let charChatAbort = null
 
     function getProxyBase() {
       const val = proxyInput.value.trim().replace(/\/+$/, '')
@@ -619,11 +685,127 @@
       }
     }
 
+    async function loadAvailableModels() {
+      try {
+        const res = await fetch(`${getProxyBase()}/v1/models`)
+        if (!res.ok) return
+        const data = await res.json()
+        availableModels = Array.isArray(data?.data) ? data.data : []
+        const sel = document.getElementById('charModelSelect')
+        if (sel) populateCharModelSelect(sel)
+      } catch {}
+    }
+
+    function populateCharModelSelect(sel) {
+      const current = sel.value
+      const opts = ['<option value="">自动（优先角色免费模型，否则默认免费模型）</option>']
+      for (const m of availableModels) {
+        opts.push(`<option value="${esc(m.id)}">${esc(m.name || m.id)} (${esc(m.id)})</option>`)
+      }
+      sel.innerHTML = opts.join('')
+      if (current) sel.value = current
+    }
+
+    function renderCharMessages() {
+      const box = document.getElementById('charChatMessages')
+      if (!box) return
+      if (!charChatHistory.length) {
+        box.innerHTML = '<div style="color: var(--muted); font-size: 12px;">发送消息开始与角色对话...</div>'
+        return
+      }
+      box.innerHTML = charChatHistory.map((m) => {
+        const reason = m.reasoning ? `<div class="chat-msg-reasoning">${esc(m.reasoning)}</div>` : ''
+        return `<div class="chat-msg ${esc(m.role)}">${reason}${esc(m.content || (m.pending ? '...' : ''))}</div>`
+      }).join('')
+      box.scrollTop = box.scrollHeight
+    }
+
+    async function sendCharChat() {
+      if (!activeCharacterDetail) return
+      const input = document.getElementById('charChatInput')
+      const sendBtn = document.getElementById('charChatSendBtn')
+      const modelSel = document.getElementById('charModelSelect')
+      const text = input?.value?.trim()
+      if (!text) return
+
+      if (charChatAbort) charChatAbort.abort()
+      charChatAbort = new AbortController()
+
+      input.value = ''
+      charChatHistory.push({ role: 'user', content: text })
+      const assistantMsg = { role: 'assistant', content: '', reasoning: '', pending: true }
+      charChatHistory.push(assistantMsg)
+      renderCharMessages()
+
+      sendBtn.disabled = true
+      sendBtn.textContent = '生成中...'
+
+      try {
+        const payload = {
+          messages: charChatHistory.slice(0, -1).map((m) => ({ role: m.role, content: m.content })),
+          stream: true,
+        }
+        if (modelSel?.value) payload.model = modelSel.value
+
+        const res = await fetch(`${getProxyBase()}/v1/characters/${encodeURIComponent(activeCharacterDetail.id)}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: charChatAbort.signal,
+        })
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => null)
+          throw new Error(errJson?.error?.message || `HTTP ${res.status}`)
+        }
+
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() || ''
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue
+            const raw = line.slice(5).trim()
+            if (!raw || raw === '[DONE]') continue
+            try {
+              const parsed = JSON.parse(raw)
+              if (parsed.error?.message) throw new Error(parsed.error.message)
+              const delta = parsed.choices?.[0]?.delta
+              if (delta?.reasoning_content) assistantMsg.reasoning += delta.reasoning_content
+              if (delta?.content) assistantMsg.content += delta.content
+              renderCharMessages()
+            } catch (err) {
+              if (err instanceof SyntaxError) continue
+              throw err
+            }
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          assistantMsg.content = assistantMsg.content || `[错误] ${e.message}`
+        }
+      } finally {
+        assistantMsg.pending = false
+        sendBtn.disabled = false
+        sendBtn.textContent = '发送'
+        renderCharMessages()
+      }
+    }
+
     async function openCharacterDetail(id) {
+      if (charChatAbort) {
+        charChatAbort.abort()
+        charChatAbort = null
+      }
       const backdrop = document.getElementById('drawerBackdrop')
       const body = document.getElementById('drawerBody')
       const title = document.getElementById('drawerTitle')
       activeCharacterDetail = null
+      charChatHistory = []
 
       title.textContent = '加载角色详情中...'
       body.innerHTML = '<div style="color: var(--muted);">正在请求 /v1/characters/' + esc(id) + ' ...</div>'
@@ -647,6 +829,10 @@
         const intro = jd.intro || ''
         const modelId = detail.modelId || jd.textSettings?.model?.id || '未指定'
 
+        if (intro) {
+          charChatHistory = [{ role: 'assistant', content: intro }]
+        }
+
         body.innerHTML = `
           <div class="detail-hero">
             <img src="${photoSrc}" alt="${esc(detail.name)}" onerror="this.style.visibility='hidden'" />
@@ -658,6 +844,21 @@
               <span class="k">绑定模型</span><span class="v">${esc(modelId)}</span>
               <span class="k">统计</span><span class="v">引用 ${detail.stats?.imports ?? 0} · 评分 ${detail.stats?.averageRating ?? 0} (${detail.stats?.ratingCount ?? 0})</span>
               ${detail.shareUrl ? `<span class="k">分享链接</span><span class="v"><a href="${esc(detail.shareUrl)}" target="_blank" style="color:#818cf8;">${esc(detail.shareUrl)}</a></span>` : ''}
+            </div>
+          </div>
+
+          <div class="section-box chat-panel">
+            <div class="section-title">
+              <span>与角色对话测试 (POST /v1/characters/${esc(detail.id)}/chat)</span>
+              <button class="btn-sm" id="charChatClearBtn">清空对话</button>
+            </div>
+            <div class="chat-controls">
+              <select id="charModelSelect"></select>
+            </div>
+            <div class="chat-messages" id="charChatMessages"></div>
+            <div class="chat-compose">
+              <input type="text" id="charChatInput" placeholder="输入对话内容，按回车发送..." />
+              <button class="primary" id="charChatSendBtn">发送</button>
             </div>
           </div>
 
@@ -692,6 +893,26 @@
             <pre style="margin-top:10px;">${esc(JSON.stringify(detail, null, 2))}</pre>
           </details>
         `
+
+        const sel = document.getElementById('charModelSelect')
+        if (sel) populateCharModelSelect(sel)
+        renderCharMessages()
+
+        document.getElementById('charChatSendBtn').onclick = () => sendCharChat()
+        document.getElementById('charChatInput').onkeydown = (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault()
+            sendCharChat()
+          }
+        }
+        document.getElementById('charChatClearBtn').onclick = () => {
+          if (charChatAbort) {
+            charChatAbort.abort()
+            charChatAbort = null
+          }
+          charChatHistory = intro ? [{ role: 'assistant', content: intro }] : []
+          renderCharMessages()
+        }
       } catch (e) {
         body.innerHTML = `<div style="color: #fca5a5;">加载详情失败：${esc(e.message)}</div>`
       }
@@ -705,20 +926,24 @@
       }
     }
 
+    function closeCharDrawer() {
+      if (charChatAbort) {
+        charChatAbort.abort()
+        charChatAbort = null
+      }
+      document.getElementById('drawerBackdrop').classList.remove('open')
+    }
+
     document.getElementById('btnPublic').onclick = () => loadPublicCharacters(1)
     document.getElementById('btnMine').onclick = () => loadMyCharacters()
-    document.getElementById('checkBtn').onclick = () => checkHealth()
+    document.getElementById('checkBtn').onclick = () => { checkHealth(); loadAvailableModels() }
     document.getElementById('prevPageBtn').onclick = () => loadPublicCharacters(Math.max(1, currentPage - 1))
     document.getElementById('nextPageBtn').onclick = () => loadPublicCharacters(currentPage + 1)
     document.getElementById('searchInput').onkeydown = (e) => {
       if (e.key === 'Enter') loadPublicCharacters(1)
     }
-    document.getElementById('closeDrawerBtn').onclick = () => {
-      document.getElementById('drawerBackdrop').classList.remove('open')
-    }
-    document.getElementById('drawerBackdrop').onclick = () => {
-      document.getElementById('drawerBackdrop').classList.remove('open')
-    }
+    document.getElementById('closeDrawerBtn').onclick = closeCharDrawer
+    document.getElementById('drawerBackdrop').onclick = closeCharDrawer
 
     document.getElementById('downloadCharJsonBtn').onclick = () => {
       if (!activeCharacterDetail) return
@@ -741,6 +966,7 @@
     }
 
     checkHealth()
+    loadAvailableModels()
   </script>
 </body>
 </html>

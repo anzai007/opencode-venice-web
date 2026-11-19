@@ -29,6 +29,15 @@ import {
   withRetryReminder,
 } from './emulate.mjs'
 import { MODELS } from './models.mjs'
+import {
+  CharacterChatError,
+  clearCharacterCache,
+  extractCharacterMeta,
+  getCachedCharacter,
+  setCachedCharacter,
+  toCharacterChatRequest,
+  toMindChatRequest,
+} from './chat-targets.mjs'
 import { debugRaw, log, preview, warn } from './log.mjs'
 import { deepStripNulls, repairJsonControlChars } from './sanitize.mjs'
 import {
@@ -512,6 +521,7 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
     answer: '',
     reasoning: '',
     terminal: false,
+    responseId: null,
     chunks: [],
     steps: new Set(),
     nativeTools: new Set(),
@@ -525,6 +535,9 @@ export async function* collectStream(upstreamBody, mapping, chunk, { stopServerL
   const apply = (event) => {
     if (event.type === 'error' || event.type === 'response.failed') {
       throw new Error(event.message ?? event.response?.error?.message ?? 'Venice generation failed')
+    }
+    if ((event.type === 'response.created' || event.type === 'response.completed') && event.response?.id) {
+      state.responseId = event.response.id
     }
     if (event.type === 'response.output_item.added' && event.item?.type) {
       itemTypes.set(event.output_index, event.item.type)
@@ -1019,6 +1032,201 @@ async function handleChat(req, res) {
   res.end()
 }
 
+/**
+ * Streams or buffers a plain Venice Responses SSE stream (used for Character Chat
+ * and remote Mind Chat without OpenCode tool-envelope parsing).
+ */
+async function respondPlainChat(req, res, { stream, modelLabel, promptMessages, upstreamBody, extraMeta = {} }) {
+  const id = `chatcmpl-${randomUUID().replaceAll('-', '')}`
+  const created = Math.floor(Date.now() / 1000)
+  const chunk = (delta, finish = null, extra = {}) => ({
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model: modelLabel,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+    ...extra,
+  })
+  const collected = collectStream(
+    upstreamBody,
+    { emulatedTools: false, request: { modelId: modelLabel } },
+    chunk,
+    { stopServerLoop: false, streamContent: false },
+  )
+
+  if (!stream) {
+    let content = ''
+    let reasoning = ''
+    let state
+    for (;;) {
+      const step = await collected.next()
+      if (step.done) {
+        state = step.value
+        break
+      }
+      const delta = step.value?.choices?.[0]?.delta
+      if (delta?.content) content += delta.content
+      if (delta?.reasoning_content) reasoning += delta.reasoning_content
+    }
+    if (!state?.terminal) throw new Error('the Venice stream ended before response.completed')
+    const message = { role: 'assistant', content }
+    if (reasoning) message.reasoning = reasoning
+    const prompt = countTokens(JSON.stringify(promptMessages ?? []))
+    const completion = countTokens(content) + countTokens(reasoning)
+    return json(res, 200, {
+      id,
+      object: 'chat.completion',
+      created,
+      model: modelLabel,
+      choices: [{ index: 0, message, finish_reason: 'stop' }],
+      usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion },
+      ...(state.responseId ? { venice_response_id: state.responseId } : {}),
+      ...extraMeta,
+    })
+  }
+
+  res.writeHead(200, {
+    ...CORS_HEADERS,
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+
+  const keepalive = setInterval(() => {
+    if (!res.writableEnded) res.write(': keepalive\n\n')
+  }, 15_000)
+  const stopKeepalive = () => {
+    clearInterval(keepalive)
+    req.off('aborted', stopKeepalive)
+  }
+  req.on('aborted', stopKeepalive)
+
+  try {
+    res.write(`data: ${JSON.stringify(chunk({ role: 'assistant', content: '' }))}\n\n`)
+    let content = ''
+    let reasoning = ''
+    let state
+    for (;;) {
+      const step = await collected.next()
+      if (step.done) {
+        state = step.value
+        break
+      }
+      const delta = step.value?.choices?.[0]?.delta
+      if (delta?.content) content += delta.content
+      if (delta?.reasoning_content) reasoning += delta.reasoning_content
+      res.write(`data: ${JSON.stringify(step.value)}\n\n`)
+    }
+    if (!state?.terminal) throw new Error('the Venice stream ended before response.completed')
+    const prompt = countTokens(JSON.stringify(promptMessages ?? []))
+    const completion = countTokens(content) + countTokens(reasoning)
+    res.write(
+      `data: ${JSON.stringify(
+        chunk({}, 'stop', {
+          usage: { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion },
+          ...(state.responseId ? { venice_response_id: state.responseId } : {}),
+          ...extraMeta,
+        }),
+      )}\n\n`,
+    )
+    res.write('data: [DONE]\n\n')
+  } catch (error) {
+    warn('stream error:', error.message)
+    res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+  } finally {
+    stopKeepalive()
+  }
+  res.end()
+}
+
+/** `POST /v1/characters/:id/chat` — fetches character persona (cached) and runs ad-hoc inference. */
+async function handleCharacterChat(req, res, characterId) {
+  const body = await readJson(req)
+  let meta = getCachedCharacter(characterId)
+  if (!meta) {
+    const detailRes = await fetchCharacterDetail(characterId, { includeJsonData: true })
+    if (!detailRes.ok) {
+      const text = await detailRes.text().catch(() => '')
+      let message = `${apiBase} responded HTTP ${detailRes.status}`
+      try {
+        const parsed = JSON.parse(text)
+        if (parsed?.error) message = typeof parsed.error === 'string' ? parsed.error : (parsed.error.message ?? message)
+      } catch {
+        if (text) message += `: ${text.slice(0, 300)}`
+      }
+      return openaiError(res, detailRes.status, message)
+    }
+    const detail = await detailRes.json()
+    meta = extractCharacterMeta(detail)
+    setCachedCharacter(characterId, meta)
+  }
+
+  const { modelId, request, images } = toCharacterChatRequest(meta, body)
+  deepStripNulls(request)
+  log(`-> character ${meta.slug || characterId} (${modelId}) • ${body.messages?.length ?? 0} msgs • stream=${body.stream === true}`)
+
+  const abort = new AbortController()
+  req.on('aborted', () => abort.abort())
+
+  let upstream
+  try {
+    upstream = await upstreamChat(request, INFERENCE_PATH, abort.signal, images)
+  } catch (error) {
+    return openaiError(res, error instanceof SignInError || error.signIn ? 401 : 502, error.message)
+  }
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => '')
+    return openaiError(res, upstream.status, `${apiBase} responded HTTP ${upstream.status}: ${text.slice(0, 400)}`)
+  }
+
+  return await respondPlainChat(req, res, {
+    stream: body.stream === true,
+    modelLabel: modelId,
+    promptMessages: body.messages,
+    upstreamBody: upstream.body,
+    extraMeta: {
+      character: {
+        id: meta.id,
+        name: meta.name,
+        slug: meta.slug,
+        intro: meta.intro || null,
+      },
+    },
+  })
+}
+
+/** `POST /v1/minds/:slug/chat` — delegates conversation to `/api/inference/chat/agents/:slug`. */
+async function handleMindChat(req, res, slug) {
+  const body = await readJson(req)
+  const { route, request, images } = toMindChatRequest(slug, body)
+  deepStripNulls(request)
+  log(`-> mind ${slug} • ${body.messages?.length ?? 0} msgs • stream=${body.stream === true}`)
+
+  const abort = new AbortController()
+  req.on('aborted', () => abort.abort())
+
+  let upstream
+  try {
+    upstream = await upstreamChat(request, route, abort.signal, images)
+  } catch (error) {
+    return openaiError(res, error instanceof SignInError || error.signIn ? 401 : 502, error.message)
+  }
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => '')
+    return openaiError(res, upstream.status, `${apiBase} responded HTTP ${upstream.status}: ${text.slice(0, 400)}`)
+  }
+
+  return await respondPlainChat(req, res, {
+    stream: body.stream === true,
+    modelLabel: body.model || `mind:${slug}`,
+    promptMessages: body.messages,
+    upstreamBody: upstream.body,
+    extraMeta: {
+      mind: { slug },
+    },
+  })
+}
+
 async function serveHtmlFile(res, filePath, url, downloadName) {
   const html = await readFile(filePath, 'utf8')
   const headers = { ...CORS_HEADERS, 'content-type': 'text/html; charset=utf-8' }
@@ -1099,6 +1307,17 @@ export function createServer() {
         if (handled !== false) return
       }
 
+      if (req.method === 'POST') {
+        const charChatMatch = url.pathname.match(/^\/(?:v1\/)?characters\/([^/]+)\/chat(?:\/completions)?$/)
+        if (charChatMatch) {
+          return await handleCharacterChat(req, res, decodeURIComponent(charChatMatch[1]))
+        }
+        const mindChatMatch = url.pathname.match(/^\/(?:v1\/)?minds\/([^/]+)\/chat(?:\/completions)?$/)
+        if (mindChatMatch) {
+          return await handleMindChat(req, res, decodeURIComponent(mindChatMatch[1]))
+        }
+      }
+
       if (req.method === 'POST' && url.pathname.endsWith('/images/generations')) {
         return await handleImageGenerations(req, res)
       }
@@ -1113,6 +1332,7 @@ export function createServer() {
 
       if (req.method === 'POST' && url.pathname === '/reload') {
         resetSessionCache()
+        clearCharacterCache()
         const session = await loadSession({ force: true })
         return json(res, 200, { ok: true, account: session.email ?? null })
       }
@@ -1120,7 +1340,9 @@ export function createServer() {
       openaiError(res, 404, `unknown endpoint: ${req.method} ${url.pathname}`, 'not_found')
     } catch (error) {
       if (error instanceof SignInError) return openaiError(res, 401, error.message)
-      if (error instanceof ImageRequestError) return openaiError(res, error.status ?? 400, error.message, 'invalid_request_error')
+      if (error instanceof ImageRequestError || error instanceof CharacterChatError) {
+        return openaiError(res, error.status ?? 400, error.message, 'invalid_request_error')
+      }
       warn('request error:', error.stack ?? error.message)
       if (!res.headersSent) openaiError(res, 500, error.message)
       else res.end()

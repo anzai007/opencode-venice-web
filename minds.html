@@ -421,6 +421,65 @@
       align-items: center;
       gap: 6px;
     }
+    .credit-warn {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      color: #fcd34d;
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .chat-panel {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .chat-messages {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      max-height: 280px;
+      min-height: 110px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .chat-msg {
+      padding: 8px 11px;
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-width: 90%;
+    }
+    .chat-msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+    }
+    .chat-msg.assistant {
+      align-self: flex-start;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .chat-msg-reasoning {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+      padding-left: 8px;
+      border-left: 2px solid var(--border);
+    }
+    .chat-compose {
+      display: flex;
+      gap: 8px;
+    }
+    .chat-compose input {
+      flex: 1;
+    }
   </style>
 </head>
 <body>
@@ -510,6 +569,8 @@
     let currentMode = 'featured' // 'featured' | 'search' | 'mine' | 'favorites'
     let nextCursor = null
     let activeMindDetail = null
+    let mindChatHistory = []
+    let mindChatAbort = null
 
     function getProxyBase() {
       const val = proxyInput.value.trim().replace(/\/+$/, '')
@@ -595,11 +656,15 @@
 
         const modelLabel = item.model?.name || item.model?.id || '未指定模型'
         const creatorName = item.creator?.userName || 'Venice'
+        const creditBadge = item.usesCredits
+          ? `<span class="card-badge" style="left:8px;right:auto;border-color:rgba(245,158,11,0.5);color:#fcd34d;">消耗积分</span>`
+          : `<span class="card-badge" style="left:8px;right:auto;border-color:rgba(34,197,94,0.5);color:#86efac;">免费</span>`
 
         card.innerHTML = `
           <div class="card-cover">
             <img src="${coverUrl}" alt="cover" loading="lazy"
                  onerror="this.style.display='none';" />
+            ${creditBadge}
             ${item.category ? `<span class="card-badge">${esc(item.category)}</span>` : ''}
           </div>
           <div class="card-avatar-wrap">
@@ -731,11 +796,105 @@
       }
     }
 
+    function renderMindMessages() {
+      const box = document.getElementById('mindChatMessages')
+      if (!box) return
+      if (!mindChatHistory.length) {
+        box.innerHTML = '<div style="color: var(--muted); font-size: 12px;">发送消息开始与该 Mind 对话...</div>'
+        return
+      }
+      box.innerHTML = mindChatHistory.map((m) => {
+        const reason = m.reasoning
+          ? `<details class="chat-msg-reasoning"><summary style="cursor:pointer;">思考过程</summary><div style="margin-top:4px;">${esc(m.reasoning)}</div></details>`
+          : ''
+        return `<div class="chat-msg ${esc(m.role)}">${reason}${esc(m.content || (m.pending ? '...' : ''))}</div>`
+      }).join('')
+      box.scrollTop = box.scrollHeight
+    }
+
+    async function sendMindChat() {
+      if (!activeMindDetail) return
+      const input = document.getElementById('mindChatInput')
+      const sendBtn = document.getElementById('mindChatSendBtn')
+      const text = input?.value?.trim()
+      if (!text) return
+
+      if (mindChatAbort) mindChatAbort.abort()
+      mindChatAbort = new AbortController()
+
+      input.value = ''
+      mindChatHistory.push({ role: 'user', content: text })
+      const assistantMsg = { role: 'assistant', content: '', reasoning: '', pending: true }
+      mindChatHistory.push(assistantMsg)
+      renderMindMessages()
+
+      sendBtn.disabled = true
+      sendBtn.textContent = '生成中...'
+
+      try {
+        const payload = {
+          messages: mindChatHistory.slice(0, -1).map((m) => ({ role: m.role, content: m.content })),
+          stream: true,
+        }
+        const res = await fetch(`${getProxyBase()}/v1/minds/${encodeURIComponent(activeMindDetail.slug)}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal: mindChatAbort.signal,
+        })
+        if (!res.ok) {
+          const errJson = await res.json().catch(() => null)
+          throw new Error(errJson?.error?.message || `HTTP ${res.status}`)
+        }
+
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        let buf = ''
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += decoder.decode(value, { stream: true })
+          const lines = buf.split('\n')
+          buf = lines.pop() || ''
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue
+            const raw = line.slice(5).trim()
+            if (!raw || raw === '[DONE]') continue
+            try {
+              const parsed = JSON.parse(raw)
+              if (parsed.error?.message) throw new Error(parsed.error.message)
+              const delta = parsed.choices?.[0]?.delta
+              if (delta?.reasoning_content) assistantMsg.reasoning += delta.reasoning_content
+              if (delta?.content) assistantMsg.content += delta.content
+              renderMindMessages()
+            } catch (err) {
+              if (err instanceof SyntaxError) continue
+              throw err
+            }
+          }
+        }
+      } catch (e) {
+        if (e.name !== 'AbortError') {
+          assistantMsg.content = assistantMsg.content || `[错误] ${e.message}`
+        }
+      } finally {
+        assistantMsg.pending = false
+        sendBtn.disabled = false
+        sendBtn.textContent = '发送'
+        renderMindMessages()
+      }
+    }
+
     async function openMindDetail(slug) {
+      if (mindChatAbort) {
+        mindChatAbort.abort()
+        mindChatAbort = null
+      }
       const backdrop = document.getElementById('drawerBackdrop')
       const body = document.getElementById('drawerBody')
       const title = document.getElementById('drawerTitle')
       activeMindDetail = null
+      mindChatHistory = []
 
       title.textContent = '加载 Mind 详情中...'
       body.innerHTML = '<div style="color: var(--muted);">正在请求 /v1/minds/' + esc(slug) + ' ...</div>'
@@ -761,6 +920,13 @@
           .map(s => `<div class="tool-chip" style="border-color:var(--border);color:var(--text);"><span>🤖</span><span>${esc(s.name)}</span></div>`)
           .join('') || '<span style="color:var(--muted);font-size:12px;">（无团队子代理）</span>'
 
+        const creditLabel = detail.usesCredits
+          ? '<span style="color:#fcd34d;font-weight:600;">消耗积分 (usesCredits: true)</span>'
+          : '<span style="color:#86efac;font-weight:600;">免费 (usesCredits: false)</span>'
+        const creditWarn = detail.usesCredits
+          ? '<div class="credit-warn">注意：该 Mind 使用服务端付费模型，发送对话会消耗账号 Credits。</div>'
+          : ''
+
         body.innerHTML = `
           <img class="detail-cover" src="${coverUrl}" alt="cover" onerror="this.style.display='none'" />
           <div class="detail-hero">
@@ -768,11 +934,25 @@
             <div class="detail-kv">
               <span class="k">Mind Slug</span><span class="v"><code>${esc(detail.slug)}</code></span>
               <span class="k">分类 / 状态</span><span class="v">${esc(detail.category || '未分类')} · ${esc(detail.state || 'active')}</span>
+              <span class="k">计费类型</span><span class="v">${creditLabel}</span>
               <span class="k">创作者</span><span class="v">@${esc(detail.creator?.userName || 'Venice')} (${esc(detail.creator?.id || '')})</span>
               <span class="k">核心模型</span><span class="v" style="color:#818cf8; font-weight:600;">${esc(detail.model?.name || detail.model?.id || '默认')}</span>
               <span class="k">推理模式</span><span class="v">${esc(detail.reasoningMode || 'disabled')} (可见性: ${esc(detail.reasoningVisibility || 'visible')})</span>
               ${detail.totalBurnedCryptoBaseUnit ? `<span class="k">代币燃烧</span><span class="v">${esc(detail.totalBurnedCryptoBaseUnit)}</span>` : ''}
               ${detail.onchainAddress ? `<span class="k">链上地址</span><span class="v"><a href="https://basescan.org/address/${esc(detail.onchainAddress)}" target="_blank" style="color:#818cf8;">${esc(detail.onchainAddress)}</a></span>` : ''}
+            </div>
+          </div>
+
+          <div class="section-box chat-panel">
+            <div class="section-title">
+              <span>与 Mind 对话测试 (POST /v1/minds/${esc(detail.slug)}/chat)</span>
+              <button class="btn-sm" id="mindChatClearBtn">清空对话</button>
+            </div>
+            ${creditWarn}
+            <div class="chat-messages" id="mindChatMessages"></div>
+            <div class="chat-compose">
+              <input type="text" id="mindChatInput" placeholder="输入对话内容，按回车发送..." />
+              <button class="primary" id="mindChatSendBtn">发送</button>
             </div>
           </div>
 
@@ -807,6 +987,23 @@
             <pre style="margin-top:10px;">${esc(JSON.stringify(detail, null, 2))}</pre>
           </details>
         `
+
+        renderMindMessages()
+        document.getElementById('mindChatSendBtn').onclick = () => sendMindChat()
+        document.getElementById('mindChatInput').onkeydown = (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault()
+            sendMindChat()
+          }
+        }
+        document.getElementById('mindChatClearBtn').onclick = () => {
+          if (mindChatAbort) {
+            mindChatAbort.abort()
+            mindChatAbort = null
+          }
+          mindChatHistory = []
+          renderMindMessages()
+        }
       } catch (e) {
         body.innerHTML = `<div style="color: #fca5a5;">加载详情失败：${esc(e.message)}</div>`
       }
@@ -819,6 +1016,14 @@
       } catch {
         alert('复制失败，请手动选中复制')
       }
+    }
+
+    function closeMindDrawer() {
+      if (mindChatAbort) {
+        mindChatAbort.abort()
+        mindChatAbort = null
+      }
+      document.getElementById('drawerBackdrop').classList.remove('open')
     }
 
     document.getElementById('btnFeatured').onclick = () => loadFeaturedMinds()
@@ -834,12 +1039,8 @@
       if (e.key === 'Enter') loadMindsSearch(null)
     }
 
-    document.getElementById('closeDrawerBtn').onclick = () => {
-      document.getElementById('drawerBackdrop').classList.remove('open')
-    }
-    document.getElementById('drawerBackdrop').onclick = () => {
-      document.getElementById('drawerBackdrop').classList.remove('open')
-    }
+    document.getElementById('closeDrawerBtn').onclick = closeMindDrawer
+    document.getElementById('drawerBackdrop').onclick = closeMindDrawer
 
     document.getElementById('downloadMindJsonBtn').onclick = () => {
       if (!activeMindDetail) return
