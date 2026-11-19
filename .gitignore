@@ -12,3 +12,9 @@ npm-debug.log*
 .idea/
 .vscode/
 *.tgz
+
+# vercel & env
+.vercel
+.env
+.env.*
+.env*

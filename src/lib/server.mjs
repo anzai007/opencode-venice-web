@@ -6,7 +6,10 @@
 import { randomUUID } from 'node:crypto'
 import { envelopeContentStream, remainingContent } from './envelope-stream.mjs'
 import { writeFileSync } from 'node:fs'
-import { apiBase, debug, dumpFile, host, judgeEnabled, judgeModel, judgeTimeoutMs, port, providerID } from './config.mjs'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { apiBase, apiKey, debug, dumpFile, host, judgeEnabled, judgeModel, judgeTimeoutMs, port, providerID } from './config.mjs'
 import {
   applyFallback,
   buildJudgeRequest,
@@ -28,7 +31,26 @@ import {
 import { MODELS } from './models.mjs'
 import { debugRaw, log, preview, warn } from './log.mjs'
 import { deepStripNulls, repairJsonControlChars } from './sanitize.mjs'
-import { AGENT_IMAGE_PATH, INFERENCE_PATH, SignInError, loadSession, resetSessionCache, upstreamChat } from './venice.mjs'
+import {
+  AGENT_IMAGE_PATH,
+  INFERENCE_PATH,
+  SignInError,
+  fetchCharacterDetail,
+  fetchCharacterPhoto,
+  fetchCharacters,
+  fetchFavoriteMinds,
+  fetchFeaturedMinds,
+  fetchMindAvatar,
+  fetchMindCover,
+  fetchMindDetail,
+  fetchMindsSearch,
+  fetchMyCharacters,
+  fetchMyMinds,
+  loadSession,
+  resetSessionCache,
+  transportFor,
+  upstreamChat,
+} from './venice.mjs'
 import {
   ImageRequestError,
   agentRequest,
@@ -44,18 +66,395 @@ import {
   seedsFor,
 } from './imagegen.mjs'
 
+const CORS_HEADERS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, OPTIONS',
+  'access-control-allow-headers': 'Content-Type, Authorization, x-api-key',
+}
+
+const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
+const CHARACTERS_HTML_PATH = path.join(ROOT_DIR, 'characters.html')
+const MINDS_HTML_PATH = path.join(ROOT_DIR, 'minds.html')
+const API_DOCS_PATH = path.join(ROOT_DIR, 'docs/API.md')
+
+/** Optional API key enforcement when `VENICE_API_KEY` is configured. */
+function isAuthorized(req, url) {
+  if (!apiKey) return true
+  const auth = req.headers.authorization
+  if (auth === `Bearer ${apiKey}`) return true
+  if (req.headers['x-api-key'] === apiKey) return true
+  if (url.searchParams.get('api_key') === apiKey) return true
+  return false
+}
+
+/** Renders the API Markdown document into a self-contained dark-mode HTML viewer. */
+function renderDocsHtml(markdown) {
+  const safeJson = JSON.stringify(markdown).replace(/</g, '\\u003c')
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Venice Web Proxy · 外部接口协议文档</title>
+  <style>
+    :root {
+      --bg: #0d0f14;
+      --surface: #151922;
+      --surface-2: #1d222e;
+      --border: #2a3142;
+      --text: #e6eaf2;
+      --muted: #8b95ab;
+      --accent: #6366f1;
+      --accent-hover: #7c7ff6;
+      --code-bg: #0a0c10;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.68;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(13, 15, 20, 0.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    .nav-links { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: var(--accent); background: #232938; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: var(--accent-hover); }
+    main {
+      max-width: 980px;
+      margin: 28px auto 64px;
+      padding: 0 24px;
+    }
+    article {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px 34px;
+    }
+    article h1 { font-size: 26px; margin: 0 0 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    article h2 { font-size: 20px; margin: 32px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border); color: #c7d2fe; }
+    article h3 { font-size: 16px; margin: 22px 0 8px; color: #e2e8f0; }
+    article h4 { font-size: 14px; margin: 16px 0 6px; color: #cbd5e1; }
+    article p { margin: 10px 0; color: #d5dce9; }
+    article ul, article ol { margin: 8px 0 12px; padding-left: 22px; }
+    article li { margin: 4px 0; color: #d5dce9; }
+    article a { color: #818cf8; text-decoration: none; }
+    article a:hover { text-decoration: underline; }
+    article hr { border: 0; border-top: 1px solid var(--border); margin: 24px 0; }
+    article blockquote {
+      margin: 12px 0;
+      padding: 10px 14px;
+      background: rgba(99, 102, 241, 0.08);
+      border-left: 3px solid var(--accent);
+      border-radius: 6px;
+      color: #cbd5e1;
+    }
+    article code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.88em;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      padding: 1px 5px;
+      border-radius: 5px;
+      color: #a5b4fc;
+    }
+    .code-wrap { position: relative; margin: 12px 0; }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      font-size: 11px;
+      padding: 3px 8px;
+      background: var(--surface-2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+    article pre {
+      margin: 0;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: #d6deeb;
+    }
+    article pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+      font-size: 13px;
+      display: block;
+      overflow-x: auto;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: var(--surface-2); color: #c7d2fe; font-weight: 600; white-space: nowrap; }
+    @media (max-width: 640px) {
+      article { padding: 18px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Venice Web Proxy · 外部接口协议文档</h1>
+    <div class="nav-links">
+      <a class="btn primary" href="/docs/api.md" target="_blank">原始 Markdown (/docs/api.md)</a>
+      <a class="btn" href="/docs/api.md?download=1">下载 .md</a>
+      <a class="btn" href="/characters.html">角色浏览器</a>
+      <a class="btn" href="/minds.html">Minds 浏览器</a>
+    </div>
+  </header>
+  <main><article id="content"></article></main>
+  <script>
+    const MD = ${safeJson};
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    function inlineFmt(s) {
+      let out = esc(s);
+      const codes = [];
+      out = out.replace(/\`([^\`]+)\`/g, (_, c) => { codes.push('<code>' + c + '</code>'); return '\\x00C' + (codes.length - 1) + '\\x00'; });
+      out = out.replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)\\s]+|\\\/[^)\\s]*)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+      out = out.replace(/\\x00C(\\d+)\\x00/g, (_, i) => codes[Number(i)]);
+      return out;
+    }
+    function renderMd(md) {
+      const lines = md.replace(/\\r\\n/g, '\\n').split('\\n');
+      const out = [];
+      let i = 0;
+      while (i < lines.length) {
+        const line = lines[i];
+        if (line.startsWith('\`\`\`')) {
+          const lang = esc(line.slice(3).trim());
+          const buf = [];
+          i++;
+          while (i < lines.length && !lines[i].startsWith('\`\`\`')) { buf.push(lines[i]); i++; }
+          i++;
+          out.push('<div class="code-wrap"><button class="copy-btn" onclick="copyCode(this)">复制</button><pre><code class="lang-' + lang + '">' + esc(buf.join('\\n')) + '</code></pre></div>');
+          continue;
+        }
+        if (/^---+$/.test(line.trim())) { out.push('<hr/>'); i++; continue; }
+        const h = /^(#{1,4})\\s+(.*)$/.exec(line);
+        if (h) { const lvl = h[1].length; out.push('<h' + lvl + '>' + inlineFmt(h[2]) + '</h' + lvl + '>'); i++; continue; }
+        if (line.startsWith('>')) {
+          const buf = [];
+          while (i < lines.length && lines[i].startsWith('>')) { buf.push(lines[i].replace(/^>\\s?/, '')); i++; }
+          out.push('<blockquote>' + buf.map(inlineFmt).join('<br/>') + '</blockquote>');
+          continue;
+        }
+        if (line.includes('|') && i + 1 < lines.length && /^\\s*\\|?[\\s:|-]+\\|\\s*$/.test(lines[i + 1])) {
+          const splitRow = (r) => r.trim().replace(/^\\|/, '').replace(/\\|$/, '').split('|').map(c => c.trim());
+          const headers = splitRow(line);
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') { rows.push(splitRow(lines[i])); i++; }
+          out.push('<table><thead><tr>' + headers.map(c => '<th>' + inlineFmt(c) + '</th>').join('') + '</tr></thead><tbody>' +
+            rows.map(r => '<tr>' + r.map(c => '<td>' + inlineFmt(c) + '</td>').join('') + '</tr>').join('') + '</tbody></table>');
+          continue;
+        }
+        if (/^\\s*[*+-]\\s+/.test(line)) {
+          const items = [];
+          while (i < lines.length && /^\\s*[*+-]\\s+/.test(lines[i])) { items.push('<li>' + inlineFmt(lines[i].replace(/^\\s*[*+-]\\s+/, '')) + '</li>'); i++; }
+          out.push('<ul>' + items.join('') + '</ul>');
+          continue;
+        }
+        if (/^\\s*\\d+\\.\\s+/.test(line)) {
+          const items = [];
+          while (i < lines.length && /^\\s*\\d+\\.\\s+/.test(lines[i])) { items.push('<li>' + inlineFmt(lines[i].replace(/^\\s*\\d+\\.\\s+/, '')) + '</li>'); i++; }
+          out.push('<ol>' + items.join('') + '</ol>');
+          continue;
+        }
+        if (line.trim() === '') { i++; continue; }
+        const p = [];
+        while (i < lines.length && lines[i].trim() !== '' && !lines[i].startsWith('\`\`\`') && !/^(#{1,4})\\s+/.test(lines[i]) && !/^---+$/.test(lines[i].trim()) && !lines[i].startsWith('>') && !/^\\s*[*+-]\\s+/.test(lines[i]) && !/^\\s*\\d+\\.\\s+/.test(lines[i])) {
+          p.push(lines[i]);
+          i++;
+        }
+        out.push('<p>' + p.map(inlineFmt).join('<br/>') + '</p>');
+      }
+      return out.join('\\n');
+    }
+    function copyCode(btn) {
+      const code = btn.nextElementSibling.innerText;
+      navigator.clipboard.writeText(code).then(() => {
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = '复制'; }, 1500);
+      });
+    }
+    document.getElementById('content').innerHTML = renderMd(MD);
+  </script>
+</body>
+</html>`
+}
+
 const json = (res, status, payload) => {
-  res.writeHead(status, { 'content-type': 'application/json' })
+  res.writeHead(status, { ...CORS_HEADERS, 'content-type': 'application/json' })
   res.end(JSON.stringify(payload))
 }
 const openaiError = (res, status, message, type = 'venice_web_error') =>
   json(res, status, { error: { message, type } })
+
+/** Forwards an upstream JSON (or error) response directly to the local client. */
+async function proxyJsonUpstream(res, upstream) {
+  const body = await upstream.text()
+  res.writeHead(upstream.status, {
+    ...CORS_HEADERS,
+    'content-type': upstream.headers.get('content-type') || 'application/json',
+  })
+  res.end(body)
+}
+
+/** Handles GET /v1/characters* and /v1/characters/:id/photo routes. */
+async function handleCharacters(req, res, url) {
+  const pathname = url.pathname
+  if (pathname === '/v1/characters' || pathname === '/characters') {
+    const query = Object.fromEntries(url.searchParams.entries())
+    const upstream = await fetchCharacters(query)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  if (pathname === '/v1/characters/me' || pathname === '/characters/me') {
+    const upstream = await fetchMyCharacters()
+    return await proxyJsonUpstream(res, upstream)
+  }
+  const photoMatch = pathname.match(/^\/(?:v1\/)?characters\/([^/]+)\/photo$/)
+  if (photoMatch) {
+    const id = decodeURIComponent(photoMatch[1])
+    const upstream = await fetchCharacterPhoto(id)
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    res.writeHead(upstream.status, {
+      ...CORS_HEADERS,
+      'content-type': upstream.headers.get('content-type') || 'image/png',
+      'cache-control': 'public, max-age=3600',
+    })
+    return res.end(buf)
+  }
+  const detailMatch = pathname.match(/^\/(?:v1\/)?characters\/([^/]+)$/)
+  if (detailMatch) {
+    const id = decodeURIComponent(detailMatch[1])
+    const includeJsonData = url.searchParams.get('includeJsonData') !== 'false'
+    const upstream = await fetchCharacterDetail(id, { includeJsonData })
+    return await proxyJsonUpstream(res, upstream)
+  }
+  return false
+}
+
+/** Handles GET /v1/minds* routes. */
+async function handleMinds(req, res, url) {
+  const pathname = url.pathname
+  if (pathname === '/v1/minds/featured' || pathname === '/minds/featured') {
+    const upstream = await fetchFeaturedMinds()
+    return await proxyJsonUpstream(res, upstream)
+  }
+  if (pathname === '/v1/minds/me' || pathname === '/minds/me') {
+    const query = Object.fromEntries(url.searchParams.entries())
+    const upstream = await fetchMyMinds(query)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  if (pathname === '/v1/minds/favorites' || pathname === '/minds/favorites') {
+    const query = Object.fromEntries(url.searchParams.entries())
+    const upstream = await fetchFavoriteMinds(query)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  if (pathname === '/v1/minds/search' || pathname === '/minds/search') {
+    const query = Object.fromEntries(url.searchParams.entries())
+    const upstream = await fetchMindsSearch(query)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  if (pathname === '/v1/minds' || pathname === '/minds') {
+    const query = Object.fromEntries(url.searchParams.entries())
+    const upstream = await fetchMindsSearch(query)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  const avatarMatch = pathname.match(/^\/(?:v1\/)?minds\/([^/]+)\/avatar$/)
+  if (avatarMatch) {
+    const slug = decodeURIComponent(avatarMatch[1])
+    const hash = url.searchParams.get('h')
+    const upstream = await fetchMindAvatar(slug, hash)
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    res.writeHead(upstream.status, {
+      ...CORS_HEADERS,
+      'content-type': upstream.headers.get('content-type') || 'image/webp',
+      'cache-control': 'public, max-age=3600',
+    })
+    return res.end(buf)
+  }
+  const coverMatch = pathname.match(/^\/(?:v1\/)?minds\/([^/]+)\/cover$/)
+  if (coverMatch) {
+    const slug = decodeURIComponent(coverMatch[1])
+    const hash = url.searchParams.get('h')
+    const upstream = await fetchMindCover(slug, hash)
+    const buf = Buffer.from(await upstream.arrayBuffer())
+    res.writeHead(upstream.status, {
+      ...CORS_HEADERS,
+      'content-type': upstream.headers.get('content-type') || 'image/webp',
+      'cache-control': 'public, max-age=3600',
+    })
+    return res.end(buf)
+  }
+  const detailMatch = pathname.match(/^\/(?:v1\/)?minds\/([^/]+)$/)
+  if (detailMatch) {
+    const slug = decodeURIComponent(detailMatch[1])
+    const upstream = await fetchMindDetail(slug)
+    return await proxyJsonUpstream(res, upstream)
+  }
+  return false
+}
 
 /** Largest request body the image routes accept. */
 const MAX_IMAGE_BODY = 64 * 1024 * 1024
 
 /** The whole request body, or a 413-shaped error past `limit` bytes. */
 async function readRaw(req, limit = Infinity) {
+  if (req.readableEnded && req.body !== undefined) {
+    const buf = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body))
+    if (buf.length > limit) {
+      const error = new ImageRequestError(`request body is larger than ${Math.round(limit / 1024 / 1024)} MB`)
+      error.status = 413
+      throw error
+    }
+    return buf
+  }
   const chunks = []
   let size = 0
   for await (const chunk of req) {
@@ -591,6 +990,7 @@ async function handleChat(req, res) {
   }
 
   res.writeHead(200, {
+    ...CORS_HEADERS,
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache',
     connection: 'keep-alive',
@@ -619,10 +1019,28 @@ async function handleChat(req, res) {
   res.end()
 }
 
+async function serveHtmlFile(res, filePath, url, downloadName) {
+  const html = await readFile(filePath, 'utf8')
+  const headers = { ...CORS_HEADERS, 'content-type': 'text/html; charset=utf-8' }
+  if (url.searchParams.get('download') === '1') {
+    headers['content-disposition'] = `attachment; filename="${downloadName}"`
+  }
+  res.writeHead(200, headers)
+  return res.end(html)
+}
+
 export function createServer() {
   return async function handler(req, res) {
-    const url = new URL(req.url, `http://${req.headers.host}`)
+    const proto = String(req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim()
+    const hostHeader = req.headers.host || 'localhost'
+    const baseUrl = `${proto}://${hostHeader}`
+    const url = new URL(req.url, baseUrl)
     try {
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, CORS_HEADERS)
+        return res.end()
+      }
+
       if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {
         const session = await loadSession().catch(() => null)
         return json(res, 200, {
@@ -630,11 +1048,55 @@ export function createServer() {
           account: session?.email ?? null,
           provider: providerID,
           models: Object.keys(MODELS).length,
+          transport: transportFor(apiBase),
+          docs: '/docs',
+          apiDocMd: '/docs/api.md',
         })
+      }
+
+      if (req.method === 'GET' && (url.pathname === '/docs/api.md' || url.pathname === '/docs/API.md' || url.pathname === '/api.md')) {
+        const rawMd = await readFile(API_DOCS_PATH, 'utf8')
+        const md = rawMd.replaceAll('{{BASE_URL}}', baseUrl)
+        const isDownload = url.searchParams.get('download') === '1'
+        res.writeHead(200, {
+          ...CORS_HEADERS,
+          'content-type': isDownload ? 'text/markdown; charset=utf-8' : 'text/plain; charset=utf-8',
+          'content-disposition': isDownload ? 'attachment; filename="venice-api-protocol.md"' : 'inline; filename="API.md"',
+        })
+        return res.end(md)
+      }
+
+      if (req.method === 'GET' && (url.pathname === '/docs' || url.pathname === '/docs/api')) {
+        const rawMd = await readFile(API_DOCS_PATH, 'utf8')
+        const md = rawMd.replaceAll('{{BASE_URL}}', baseUrl)
+        res.writeHead(200, { ...CORS_HEADERS, 'content-type': 'text/html; charset=utf-8' })
+        return res.end(renderDocsHtml(md))
+      }
+
+      if (req.method === 'GET' && url.pathname === '/characters.html') {
+        return await serveHtmlFile(res, CHARACTERS_HTML_PATH, url, 'venice-characters.html')
+      }
+
+      if (req.method === 'GET' && url.pathname === '/minds.html') {
+        return await serveHtmlFile(res, MINDS_HTML_PATH, url, 'venice-minds.html')
+      }
+
+      if (!isAuthorized(req, url)) {
+        return openaiError(res, 401, 'invalid or missing API key', 'authentication_error')
       }
 
       if (req.method === 'GET' && (url.pathname === '/v1/models' || url.pathname === '/models')) {
         return json(res, 200, modelList())
+      }
+
+      if (req.method === 'GET' && (url.pathname.startsWith('/v1/characters') || url.pathname.startsWith('/characters'))) {
+        const handled = await handleCharacters(req, res, url)
+        if (handled !== false) return
+      }
+
+      if (req.method === 'GET' && (url.pathname.startsWith('/v1/minds') || url.pathname.startsWith('/minds'))) {
+        const handled = await handleMinds(req, res, url)
+        if (handled !== false) return
       }
 
       if (req.method === 'POST' && url.pathname.endsWith('/images/generations')) {

@@ -15,7 +15,13 @@ export const configDir = path.resolve(
     path.join(process.env.XDG_CONFIG_HOME ?? path.join(home, '.config'), 'opencode', 'venice-web'),
 )
 
-export const sessionFile = process.env.VENICE_WEB_SESSION ?? path.join(configDir, 'session.json')
+export const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME)
+
+export const apiKey = (process.env.VENICE_API_KEY ?? '').trim()
+
+export const sessionFile =
+  process.env.VENICE_WEB_SESSION ??
+  (isServerless ? path.join(os.tmpdir(), 'venice-web-session.json') : path.join(configDir, 'session.json'))
 
 export const host = process.env.VENICE_WEB_HOST ?? '127.0.0.1'
 export const port = Number(process.env.VENICE_WEB_PORT ?? 3456)

@@ -7,13 +7,14 @@
  * keeps the cookie rotation that Clerk performs while it happens.
  */
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import {
   apiBase,
   attestationTtlMs,
   clerkBase,
   clerkVersion,
+  isServerless,
   middlefaceVersion,
   requestTimeoutMs,
   sessionFile,
@@ -39,7 +40,48 @@ export class SignInError extends Error {
   }
 }
 
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+/** Reads session credentials from serverless environment variables, if configured. */
+function readSessionFromEnv() {
+  let data = null
+  if (process.env.VENICE_SESSION_B64) {
+    const raw = Buffer.from(process.env.VENICE_SESSION_B64.trim(), 'base64').toString('utf8')
+    data = JSON.parse(raw)
+  } else if (process.env.VENICE_SESSION_JSON) {
+    data = JSON.parse(process.env.VENICE_SESSION_JSON)
+  } else if (process.env.VENICE_CLIENT_COOKIE) {
+    data = {
+      client: process.env.VENICE_CLIENT_COOKIE.trim(),
+      userAgent: (process.env.VENICE_USER_AGENT ?? '').trim() || DEFAULT_USER_AGENT,
+      uid: process.env.VENICE_UID || undefined,
+      sessionId: process.env.VENICE_SESSION_ID || undefined,
+      email: process.env.VENICE_EMAIL || undefined,
+    }
+  }
+  if (!data) return null
+  data.envKey = createHash('sha256').update(String(data.client ?? '')).digest('hex').slice(0, 16)
+  return data
+}
+
 export async function readSession() {
+  const envSession = readSessionFromEnv()
+  if (envSession) {
+    try {
+      const disk = JSON.parse(await readFile(sessionFile, 'utf8'))
+      if (disk?.envKey === envSession.envKey && disk.client && disk.userAgent) {
+        return disk
+      }
+    } catch {
+      /* cold start or no writable disk cache yet */
+    }
+    if (!envSession.client || !envSession.userAgent) {
+      throw new SignInError('session env var is incomplete; check VENICE_SESSION_B64 / VENICE_SESSION_JSON')
+    }
+    return envSession
+  }
+
   const raw = await readFile(sessionFile, 'utf8')
   const data = JSON.parse(raw)
   if (!data.client || !data.userAgent) {
@@ -55,16 +97,22 @@ export async function loadSession({ force = false } = {}) {
 }
 
 export async function saveSession() {
+  if (!state) return
   const tmp = `${sessionFile}.${randomUUID()}.tmp`
-  await mkdir(path.dirname(sessionFile), { recursive: true })
-  await writeFile(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
-  await rename(tmp, sessionFile)
+  try {
+    await mkdir(path.dirname(sessionFile), { recursive: true })
+    await writeFile(tmp, JSON.stringify(state, null, 1), { mode: 0o600 })
+    await rename(tmp, sessionFile)
+  } catch (error) {
+    if (!isServerless) throw error
+  }
 }
 
 export function resetSessionCache() {
   state = null
   tokenFlight = null
   attestation = null
+  cachedVeniceUserId = null
 }
 
 /** Only venice.ai and its Clerk backend are ever contacted. */
@@ -264,6 +312,146 @@ export async function probeAccount() {
   const session = await loadSession()
   await ensureSessionIdentity(session)
   return { email: session.email, uid: session.uid, sessionId: session.sessionId }
+}
+
+/**
+ * Issues an authenticated GET request against `outerface.venice.ai`, retrying
+ * once with a freshly minted Clerk JWT on HTTP 401.
+ */
+async function authedVeniceGet(route, signal) {
+  const timeout = signal
+    ? AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMs)])
+    : AbortSignal.timeout(requestTimeoutMs)
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const access = await mintToken({ force: attempt > 0 })
+    const headers = {
+      authorization: `Bearer ${access}`,
+      'x-venice-middleface-version': middlefaceVersion,
+      'x-venice-request-timestamp-ms': String(Date.now()),
+    }
+    const response = await veneziaFetch(apiBase + route, {
+      method: 'GET',
+      headers,
+      signal: timeout,
+    })
+    if (response.status === 401 && attempt === 0) {
+      await response.body?.cancel()
+      continue
+    }
+    return response
+  }
+  throw new Error('Venice request failed')
+}
+
+/** Fetches the public character catalogue with optional query filters. */
+export async function fetchCharacters(query = {}, signal) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') {
+      params.set(key, String(value))
+    }
+  }
+  const qs = params.toString()
+  return authedVeniceGet(`/api/characters${qs ? `?${qs}` : ''}`, signal)
+}
+
+/** Fetches the signed-in user's own created characters. */
+export async function fetchMyCharacters(signal) {
+  return authedVeniceGet('/api/characters/me', signal)
+}
+
+/** Fetches a single character's details (including `jsonData` by default). */
+export async function fetchCharacterDetail(characterId, { includeJsonData = true, signal } = {}) {
+  const id = encodeURIComponent(characterId)
+  return authedVeniceGet(`/api/characters/${id}?includeJsonData=${Boolean(includeJsonData)}`, signal)
+}
+
+/** Fetches a character's avatar image binary response. */
+export async function fetchCharacterPhoto(characterId, signal) {
+  const id = encodeURIComponent(characterId)
+  return authedVeniceGet(`/api/characters/${id}/photo`, signal)
+}
+
+/** Fetches featured minds (GET /api/v2/agents/featured). */
+export async function fetchFeaturedMinds(signal) {
+  return authedVeniceGet('/api/v2/agents/featured', signal)
+}
+
+/** Searches minds with optional category, query, sort, and pagination filters. */
+export async function fetchMindsSearch(query = {}, signal) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') {
+      params.set(key, String(value))
+    }
+  }
+  const qs = params.toString()
+  return authedVeniceGet(`/api/v2/agents/search${qs ? `?${qs}` : ''}`, signal)
+}
+
+/** Fetches the signed-in user's favorite minds. */
+export async function fetchFavoriteMinds(query = {}, signal) {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== '') {
+      params.set(key, String(value))
+    }
+  }
+  const qs = params.toString()
+  return authedVeniceGet(`/api/v2/agents/favorites${qs ? `?${qs}` : ''}`, signal)
+}
+
+/** Fetches full detail of a mind by its slug (GET /api/v2/agents/:slug). */
+export async function fetchMindDetail(slug, signal) {
+  const id = encodeURIComponent(slug)
+  return authedVeniceGet(`/api/v2/agents/${id}`, signal)
+}
+
+/** Fetches a mind's avatar image. */
+export async function fetchMindAvatar(slug, hash, signal) {
+  const id = encodeURIComponent(slug)
+  const qs = hash ? `?h=${encodeURIComponent(hash)}` : ''
+  return authedVeniceGet(`/api/v2/agents/${id}/avatar${qs}`, signal)
+}
+
+/** Fetches a mind's cover banner image. */
+export async function fetchMindCover(slug, hash, signal) {
+  const id = encodeURIComponent(slug)
+  const qs = hash ? `?h=${encodeURIComponent(hash)}` : ''
+  return authedVeniceGet(`/api/v2/agents/${id}/cover${qs}`, signal)
+}
+
+let cachedVeniceUserId = null
+
+/** Resolves the Venice user profile UUID from /api/user/session. */
+export async function getVeniceUserId(signal) {
+  if (cachedVeniceUserId) return cachedVeniceUserId
+  const response = await authedVeniceGet('/api/user/session', signal)
+  if (!response.ok) return null
+  const data = await response.json().catch(() => null)
+  if (data?.token) {
+    try {
+      const claims = JSON.parse(Buffer.from(data.token.split('.')[1], 'base64url').toString('utf8'))
+      if (claims.userId) {
+        cachedVeniceUserId = claims.userId
+        return claims.userId
+      }
+    } catch {}
+  }
+  return null
+}
+
+/** Fetches minds created by the signed-in user. */
+export async function fetchMyMinds(query = {}, signal) {
+  const userId = await getVeniceUserId(signal)
+  if (!userId) {
+    return new Response(JSON.stringify({ data: [], limit: 20, nextCursor: null }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  return fetchMindsSearch({ ...query, creatorId: userId }, signal)
 }
 
 export { AGENT_IMAGE_PATH, INFERENCE_PATH }

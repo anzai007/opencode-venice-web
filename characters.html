@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Venice 角色浏览器 (基于本地代理接口)</title>
+  <style>
+    :root {
+      --bg: #0d0f14;
+      --surface: #151922;
+      --surface-2: #1d222e;
+      --border: #2a3142;
+      --text: #e6eaf2;
+      --muted: #8b95ab;
+      --accent: #6366f1;
+      --accent-hover: #7c7ff6;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(13, 15, 20, 0.9);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    .dot.ok { background: var(--ok); }
+    .dot.err { background: var(--err); }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    input[type="text"], input[type="url"], select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    button {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    button:hover:not(:disabled) {
+      border-color: var(--accent);
+      background: #232938;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .toolbar {
+      max-width: 1400px;
+      margin: 20px auto 0;
+      padding: 0 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    .toolbar .search-box {
+      flex: 1;
+      min-width: 220px;
+    }
+    .checkbox-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+      padding: 0 6px;
+    }
+    .main-wrap {
+      max-width: 1400px;
+      margin: 18px auto 40px;
+      padding: 0 24px;
+    }
+    .meta-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      min-height: 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      transition: transform 0.15s ease, border-color 0.15s ease;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: var(--accent);
+    }
+    .card-cover {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      background: var(--surface-2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    .card-cover img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .avatar-fallback {
+      font-size: 42px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .card-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: rgba(13, 15, 20, 0.78);
+      backdrop-filter: blur(4px);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .card-body {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+    }
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .card-sub {
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-desc {
+      font-size: 12px;
+      color: #b4bdd0;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      margin: 0;
+    }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: auto;
+      padding-top: 4px;
+    }
+    .tag {
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 12px;
+      margin-top: 24px;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 64px 20px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+    }
+    .error-banner {
+      background: rgba(239, 68, 68, 0.12);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fca5a5;
+      padding: 12px 16px;
+      border-radius: 10px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      display: none;
+    }
+    /* Drawer */
+    .drawer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      z-index: 40;
+      display: none;
+      justify-content: flex-end;
+    }
+    .drawer-backdrop.open { display: flex; }
+    .drawer {
+      width: min(640px, 100vw);
+      height: 100%;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .drawer-head {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .drawer-head h2 {
+      margin: 0;
+      font-size: 17px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .drawer-body {
+      padding: 20px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      flex: 1;
+    }
+    .detail-hero {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+    }
+    .detail-hero img {
+      width: 112px;
+      height: 112px;
+      border-radius: 12px;
+      object-fit: cover;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .detail-kv {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 12px;
+      font-size: 12px;
+    }
+    .detail-kv .k { color: var(--muted); }
+    .detail-kv .v { word-break: break-all; }
+    .section-box {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+    .section-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #d6deeb;
+    }
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Venice 角色浏览器</h1>
+      <div class="status-pill" id="statusPill">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">检测代理中...</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <a href="/minds.html" onclick="this.href=getProxyBase()+'/minds.html'" style="font-size:12px;color:#a5b4fc;text-decoration:none;padding:0 4px;">Minds</a>
+      <a href="/docs" onclick="this.href=getProxyBase()+'/docs'" style="font-size:12px;color:#a5b4fc;text-decoration:none;padding:0 4px;">接口文档</a>
+      <label style="font-size: 12px; color: var(--muted);">代理地址</label>
+      <input type="url" id="proxyInput" style="width: 200px;" />
+      <button id="checkBtn">刷新状态</button>
+      <button id="downloadHtmlBtn">下载此 HTML</button>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button class="primary" id="btnPublic">获取角色列表</button>
+    <button id="btnMine">获取我的角色</button>
+    <input type="text" id="searchInput" class="search-box" placeholder="搜索角色名称、描述或关键词..." />
+    <select id="sortSelect">
+      <option value="featured" selected>精选 (featured)</option>
+      <option value="mostRecent">最新 (mostRecent)</option>
+      <option value="imports">引用最多 (imports)</option>
+      <option value="highestRating">评分最高 (highestRating)</option>
+      <option value="ratingCount">评价最多 (ratingCount)</option>
+      <option value="highlyRatedAndRecent">高分且最新</option>
+    </select>
+    <select id="pageSizeSelect">
+      <option value="12">12 条/页</option>
+      <option value="20" selected>20 条/页</option>
+      <option value="40">40 条/页</option>
+      <option value="100">100 条/页</option>
+    </select>
+    <label class="checkbox-label">
+      <input type="checkbox" id="adultCheck" />
+      包含成人内容 (isAdult)
+    </label>
+  </div>
+
+  <div class="main-wrap">
+    <div class="error-banner" id="errorBanner"></div>
+    <div class="meta-bar">
+      <span id="metaInfo">点击「获取角色列表」或「获取我的角色」开始加载</span>
+      <span id="loadingInfo"></span>
+    </div>
+    <div id="gridContainer">
+      <div class="empty-state">尚未加载数据，请点击上方按钮。</div>
+    </div>
+    <div class="pagination" id="paginationBar" style="display: none;">
+      <button id="prevPageBtn">上一页</button>
+      <span id="pageIndicator" style="font-size: 13px; color: var(--muted);"></span>
+      <button id="nextPageBtn">下一页</button>
+    </div>
+  </div>
+
+  <div class="drawer-backdrop" id="drawerBackdrop">
+    <div class="drawer" onclick="event.stopPropagation()">
+      <div class="drawer-head">
+        <h2 id="drawerTitle">角色详情</h2>
+        <div style="display: flex; gap: 8px;">
+          <button class="btn-sm" id="downloadCharJsonBtn">下载角色 JSON</button>
+          <button class="btn-sm" id="closeDrawerBtn">关闭</button>
+        </div>
+      </div>
+      <div class="drawer-body" id="drawerBody"></div>
+    </div>
+  </div>
+
+  <script>
+    const defaultProxy = location.protocol.startsWith('http') ? location.origin : 'http://127.0.0.1:3456'
+    const proxyInput = document.getElementById('proxyInput')
+    proxyInput.value = localStorage.getItem('venice_proxy_url') || defaultProxy
+
+    let currentMode = 'public' // 'public' | 'mine'
+    let currentPage = 1
+    let lastPagination = null
+    let activeCharacterDetail = null
+
+    function getProxyBase() {
+      const val = proxyInput.value.trim().replace(/\/+$/, '')
+      localStorage.setItem('venice_proxy_url', val)
+      return val
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('errorBanner')
+      if (!msg) {
+        el.style.display = 'none'
+        el.textContent = ''
+        return
+      }
+      el.textContent = msg
+      el.style.display = 'block'
+    }
+
+    function setLoading(text) {
+      document.getElementById('loadingInfo').textContent = text || ''
+    }
+
+    function esc(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+    }
+
+    async function checkHealth() {
+      const dot = document.getElementById('statusDot')
+      const txt = document.getElementById('statusText')
+      dot.className = 'dot'
+      txt.textContent = '连接中...'
+      try {
+        const res = await fetch(`${getProxyBase()}/health`)
+        const data = await res.json()
+        if (res.ok && data.ok) {
+          dot.className = 'dot ok'
+          txt.textContent = `已连接 (${data.account || '已登录'})`
+        } else {
+          dot.className = 'dot err'
+          txt.textContent = '未登录或会话无效'
+        }
+      } catch (e) {
+        dot.className = 'dot err'
+        txt.textContent = '代理未启动或无法访问'
+      }
+    }
+
+    function renderCards(items) {
+      const container = document.getElementById('gridContainer')
+      if (!items || items.length === 0) {
+        container.innerHTML = `<div class="empty-state">${currentMode === 'mine' ? '当前账号下还没有创建任何角色卡。' : '没有找到符合条件的角色。'}</div>`
+        return
+      }
+
+      const base = getProxyBase()
+      const grid = document.createElement('div')
+      grid.className = 'grid'
+
+      for (const item of items) {
+        const card = document.createElement('div')
+        card.className = 'card'
+        card.onclick = () => openCharacterDetail(item.id)
+
+        const tags = Array.isArray(item.tags) ? item.tags.slice(0, 4) : []
+        const tagHtml = tags
+          .map(t => `<span class="tag">${esc(typeof t === 'string' ? t : t.name)}</span>`)
+          .join('')
+
+        const photoUrl = `${base}/v1/characters/${encodeURIComponent(item.id)}/photo`
+        const initial = esc((item.name || '?').slice(0, 1).toUpperCase())
+        const imports = item.stats?.imports ?? 0
+        const modelLabel = item.modelId ? esc(item.modelId) : '默认模型'
+
+        card.innerHTML = `
+          <div class="card-cover">
+            <img src="${photoUrl}" alt="${esc(item.name)}" loading="lazy"
+                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />
+            <div class="avatar-fallback" style="display:none;">${initial}</div>
+            ${item.featured ? `<span class="card-badge" style="left:8px;right:auto;border-color:var(--accent);color:#c7d2fe;">精选</span>` : ''}
+            ${item.status ? `<span class="card-badge">${esc(item.status)}</span>` : ''}
+          </div>
+          <div class="card-body">
+            <h3 class="card-title" title="${esc(item.name)}">${esc(item.name)}</h3>
+            <div class="card-sub">
+              <span>@${esc(item.author || 'me')}</span>
+              <span>引用 ${imports}</span>
+            </div>
+            <div class="card-sub" style="color: #818cf8;">
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${modelLabel}">${modelLabel}</span>
+            </div>
+            <p class="card-desc">${esc(item.description || '暂无描述')}</p>
+            <div class="tags">${tagHtml}</div>
+          </div>
+        `
+        grid.appendChild(card)
+      }
+
+      container.innerHTML = ''
+      container.appendChild(grid)
+    }
+
+    async function loadPublicCharacters(page = 1) {
+      currentMode = 'public'
+      currentPage = page
+      showError('')
+      setLoading('正在获取角色列表...')
+
+      const params = new URLSearchParams({
+        page: String(page),
+        pageSize: document.getElementById('pageSizeSelect').value,
+        sortBy: document.getElementById('sortSelect').value,
+      })
+      const search = document.getElementById('searchInput').value.trim()
+      if (search) params.set('search', search)
+      params.set('isAdult', document.getElementById('adultCheck').checked ? 'true' : 'false')
+
+      try {
+        const res = await fetch(`${getProxyBase()}/v1/characters?${params.toString()}`)
+        const json = await res.json()
+        if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}`)
+
+        const list = Array.isArray(json) ? json : (json.data || [])
+        lastPagination = json.pagination || null
+        renderCards(list)
+
+        const metaEl = document.getElementById('metaInfo')
+        const pageBar = document.getElementById('paginationBar')
+        if (lastPagination) {
+          metaEl.textContent = `公开角色库：共 ${lastPagination.totalItems} 个匹配角色（全库总计 ${lastPagination.allCharacters} 个）`
+          pageBar.style.display = 'flex'
+          document.getElementById('pageIndicator').textContent = `第 ${lastPagination.currentPage} / ${lastPagination.totalPages} 页`
+          document.getElementById('prevPageBtn').disabled = !lastPagination.hasPreviousPage
+          document.getElementById('nextPageBtn').disabled = !lastPagination.hasNextPage
+        } else {
+          metaEl.textContent = `共加载 ${list.length} 个角色`
+          pageBar.style.display = 'none'
+        }
+      } catch (e) {
+        showError(`获取角色列表失败：${e.message}（请确保本地代理已运行并完成登录）`)
+      } finally {
+        setLoading('')
+      }
+    }
+
+    async function loadMyCharacters() {
+      currentMode = 'mine'
+      showError('')
+      setLoading('正在获取我的角色...')
+      document.getElementById('paginationBar').style.display = 'none'
+
+      try {
+        const res = await fetch(`${getProxyBase()}/v1/characters/me`)
+        const json = await res.json()
+        if (!res.ok) throw new Error(json.error?.message || `HTTP ${res.status}`)
+
+        const list = Array.isArray(json) ? json : (json.data || [])
+        renderCards(list)
+        document.getElementById('metaInfo').textContent = `我的角色卡：共 ${list.length} 个`
+      } catch (e) {
+        showError(`获取我的角色失败：${e.message}`)
+      } finally {
+        setLoading('')
+      }
+    }
+
+    async function openCharacterDetail(id) {
+      const backdrop = document.getElementById('drawerBackdrop')
+      const body = document.getElementById('drawerBody')
+      const title = document.getElementById('drawerTitle')
+      activeCharacterDetail = null
+
+      title.textContent = '加载角色详情中...'
+      body.innerHTML = '<div style="color: var(--muted);">正在请求 /v1/characters/' + esc(id) + ' ...</div>'
+      backdrop.classList.add('open')
+
+      try {
+        const base = getProxyBase()
+        const res = await fetch(`${base}/v1/characters/${encodeURIComponent(id)}?includeJsonData=true`)
+        const detail = await res.json()
+        if (!res.ok) throw new Error(detail.error?.message || `HTTP ${res.status}`)
+
+        activeCharacterDetail = detail
+        title.textContent = detail.name || '角色详情'
+
+        const jd = detail.jsonData || {}
+        const photoSrc = jd.photo && jd.photo.startsWith('data:')
+          ? jd.photo
+          : `${base}/v1/characters/${encodeURIComponent(detail.id)}/photo`
+
+        const instructions = jd.instructions || ''
+        const intro = jd.intro || ''
+        const modelId = detail.modelId || jd.textSettings?.model?.id || '未指定'
+
+        body.innerHTML = `
+          <div class="detail-hero">
+            <img src="${photoSrc}" alt="${esc(detail.name)}" onerror="this.style.visibility='hidden'" />
+            <div class="detail-kv">
+              <span class="k">角色 ID</span><span class="v">${esc(detail.id)}</span>
+              <span class="k">Slug</span><span class="v">${esc(detail.slug)}</span>
+              <span class="k">作者</span><span class="v">${esc(detail.author)}</span>
+              <span class="k">状态</span><span class="v">${esc(detail.status)} (Adult: ${Boolean(detail.adult)})</span>
+              <span class="k">绑定模型</span><span class="v">${esc(modelId)}</span>
+              <span class="k">统计</span><span class="v">引用 ${detail.stats?.imports ?? 0} · 评分 ${detail.stats?.averageRating ?? 0} (${detail.stats?.ratingCount ?? 0})</span>
+              ${detail.shareUrl ? `<span class="k">分享链接</span><span class="v"><a href="${esc(detail.shareUrl)}" target="_blank" style="color:#818cf8;">${esc(detail.shareUrl)}</a></span>` : ''}
+            </div>
+          </div>
+
+          <div class="section-box">
+            <div class="section-title">
+              <span>开场白 (jsonData.intro)</span>
+              <button class="btn-sm" onclick="copyText(activeCharacterDetail?.jsonData?.intro || '')">复制</button>
+            </div>
+            <pre>${esc(intro || '（无开场白）')}</pre>
+          </div>
+
+          <div class="section-box">
+            <div class="section-title">
+              <span>核心人设指令 (jsonData.instructions)</span>
+              <button class="btn-sm" onclick="copyText(activeCharacterDetail?.jsonData?.instructions || '')">复制 Prompt</button>
+            </div>
+            <pre>${esc(instructions || '（无 instructions）')}</pre>
+          </div>
+
+          <div class="section-box">
+            <div class="section-title"><span>公开简介 (description)</span></div>
+            <pre>${esc(detail.description || '（无描述）')}</pre>
+          </div>
+
+          <div class="section-box">
+            <div class="section-title"><span>模型与语音设置 (textSettings / characterVoice)</span></div>
+            <pre>${esc(JSON.stringify({ textSettings: jd.textSettings, characterVoice: jd.characterVoice }, null, 2))}</pre>
+          </div>
+
+          <details class="section-box">
+            <summary style="cursor:pointer; font-size:12px; color:var(--muted);">查看完整原始 JSON 数据</summary>
+            <pre style="margin-top:10px;">${esc(JSON.stringify(detail, null, 2))}</pre>
+          </details>
+        `
+      } catch (e) {
+        body.innerHTML = `<div style="color: #fca5a5;">加载详情失败：${esc(e.message)}</div>`
+      }
+    }
+
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text)
+      } catch {
+        alert('复制失败，请手动选中复制')
+      }
+    }
+
+    document.getElementById('btnPublic').onclick = () => loadPublicCharacters(1)
+    document.getElementById('btnMine').onclick = () => loadMyCharacters()
+    document.getElementById('checkBtn').onclick = () => checkHealth()
+    document.getElementById('prevPageBtn').onclick = () => loadPublicCharacters(Math.max(1, currentPage - 1))
+    document.getElementById('nextPageBtn').onclick = () => loadPublicCharacters(currentPage + 1)
+    document.getElementById('searchInput').onkeydown = (e) => {
+      if (e.key === 'Enter') loadPublicCharacters(1)
+    }
+    document.getElementById('closeDrawerBtn').onclick = () => {
+      document.getElementById('drawerBackdrop').classList.remove('open')
+    }
+    document.getElementById('drawerBackdrop').onclick = () => {
+      document.getElementById('drawerBackdrop').classList.remove('open')
+    }
+
+    document.getElementById('downloadCharJsonBtn').onclick = () => {
+      if (!activeCharacterDetail) return
+      const blob = new Blob([JSON.stringify(activeCharacterDetail, null, 2)], { type: 'application/json' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `${activeCharacterDetail.slug || activeCharacterDetail.id || 'character'}.json`
+      a.click()
+      URL.revokeObjectURL(a.href)
+    }
+
+    document.getElementById('downloadHtmlBtn').onclick = () => {
+      const html = '<!DOCTYPE html>\n' + document.documentElement.outerHTML
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = 'venice-characters.html'
+      a.click()
+      URL.revokeObjectURL(a.href)
+    }
+
+    checkHealth()
+  </script>
+</body>
+</html>
